@@ -1,38 +1,32 @@
 /**
- * FileUploader - Client-side chunked file upload with parallel processing
- * 
- * Mirrors the scraper.class.php architecture but for uploads instead of downloads
- * 
- * Features:
- * - Chunked file uploads for large files
- * - Parallel chunk uploads (configurable concurrency)
- * - Automatic retry logic for failed chunks
- * - Progress tracking with callbacks
- * - Resume capability (track uploaded chunks)
- * - Multiple file support
- * - Bandwidth throttling (optional)
+ * TurboPush - High-Performance Chunked File Upload Library
+ *
+ * @version 1.0.0
+ * @license MIT
  */
 
-interface FileUploadConfig {
+interface TurboPushConfig {
     endpoint: string;
-    chunkSize?: number;                 // Size of each chunk in bytes (default: 1MB)
-    maxConcurrentUploads?: number;       // Max parallel chunk uploads (default: 3)
-    maxRetries?: number;                 // Max retry attempts (default: 3)
-    retryDelay?: number;                 // Delay between retries in ms (default: 1000)
-    timeout?: number;                    // Request timeout in ms (default: 30000)
-    headers?: Record<string, string>;    // Custom headers
-    withCredentials?: boolean;           // Include cookies (default: false)
+    chunkSize?: number;
+    maxConcurrentUploads?: number;
+    maxRetries?: number;
+    retryDelay?: number;
+    timeout?: number;
+    headers?: Record<string, string>;
+    withCredentials?: boolean;
 }
 
 interface UploadProgress {
     file: File;
     fileName: string;
+    fileId: string;
     totalSize: number;
     uploadedSize: number;
     percentage: number;
-    speed: number;                       // Bytes per second
-    remainingTime: number;               // Seconds
+    speed: number;
+    remainingTime: number;
     status: 'pending' | 'uploading' | 'completed' | 'failed' | 'paused';
+    error?: string;
 }
 
 interface ChunkInfo {
@@ -53,28 +47,34 @@ interface UploadStats {
     startTime: number;
     endTime?: number;
     duration?: number;
+    averageSpeed?: number;
 }
 
-export class FileUploader {
-    private config: Required<FileUploadConfig>;
+export class TurboPush {
+    private config: Required<TurboPushConfig>;
     private files: Map<string, File> = new Map();
     private fileProgress: Map<string, UploadProgress> = new Map();
     private fileChunks: Map<string, ChunkInfo[]> = new Map();
     private activeUploads: Map<string, AbortController> = new Map();
     private stats: UploadStats;
     private progressCallback?: (progress: UploadProgress[]) => void;
+    private fileCompleteCallback?: (fileName: string, fileId: string) => void;
     private completeCallback?: (stats: UploadStats) => void;
-    private errorCallback?: (error: Error, fileName: string) => void;
+    private errorCallback?: (error: Error, fileName: string, fileId: string) => void;
     private isPaused: boolean = false;
 
-    constructor(config: FileUploadConfig) {
+    constructor(config: TurboPushConfig) {
+        if (!config.endpoint) {
+            throw new Error('TurboPush: endpoint is required');
+        }
+
         this.config = {
             endpoint: config.endpoint,
-            chunkSize: config.chunkSize || 1024 * 1024, // 1MB default
-            maxConcurrentUploads: config.maxConcurrentUploads || 3,
-            maxRetries: config.maxRetries || 3,
-            retryDelay: config.retryDelay || 1000,
-            timeout: config.timeout || 30000,
+            chunkSize: config.chunkSize || 1024 * 1024,
+            maxConcurrentUploads: Math.max(1, Math.min(10, config.maxConcurrentUploads || 3)),
+            maxRetries: Math.max(0, config.maxRetries || 3),
+            retryDelay: Math.max(100, config.retryDelay || 1000),
+            timeout: Math.max(5000, config.timeout || 30000),
             headers: config.headers || {},
             withCredentials: config.withCredentials || false
         };
@@ -89,20 +89,14 @@ export class FileUploader {
         };
     }
 
-    /* ========================================================================
-     * PUBLIC API (Similar to scraper.class.php)
-     * ======================================================================== */
-
-    /**
-     * Add a file to the upload queue
-     */
     public addFile(file: File): this {
         const fileId = this.generateFileId(file);
         this.files.set(fileId, file);
-        
+
         this.fileProgress.set(fileId, {
             file,
             fileName: file.name,
+            fileId,
             totalSize: file.size,
             uploadedSize: 0,
             percentage: 0,
@@ -113,92 +107,62 @@ export class FileUploader {
 
         this.stats.totalFiles++;
         this.stats.totalBytes += file.size;
-
         return this;
     }
 
-    /**
-     * Add multiple files at once
-     */
     public addFiles(files: File[] | FileList): this {
         Array.from(files).forEach(file => this.addFile(file));
         return this;
     }
 
-    /**
-     * Set progress callback (similar to setProgressCallback in scraper)
-     */
     public onProgress(callback: (progress: UploadProgress[]) => void): this {
         this.progressCallback = callback;
         return this;
     }
 
-    /**
-     * Set completion callback
-     */
+    public onFileComplete(callback: (fileName: string, fileId: string) => void): this {
+        this.fileCompleteCallback = callback;
+        return this;
+    }
+
     public onComplete(callback: (stats: UploadStats) => void): this {
         this.completeCallback = callback;
         return this;
     }
 
-    /**
-     * Set error callback
-     */
-    public onError(callback: (error: Error, fileName: string) => void): this {
+    public onError(callback: (error: Error, fileName: string, fileId: string) => void): this {
         this.errorCallback = callback;
         return this;
     }
 
-    /**
-     * Set chunk size (similar to configuration methods in scraper)
-     */
     public setChunkSize(bytes: number): this {
-        this.config.chunkSize = Math.max(64 * 1024, bytes); // Min 64KB
+        this.config.chunkSize = Math.max(64 * 1024, bytes);
         return this;
     }
 
-    /**
-     * Set max concurrent uploads (similar to setMaxConcurrentDownloads)
-     */
     public setMaxConcurrentUploads(count: number): this {
         this.config.maxConcurrentUploads = Math.max(1, Math.min(10, count));
         return this;
     }
 
-    /**
-     * Set max retry attempts
-     */
     public setMaxRetries(count: number): this {
         this.config.maxRetries = Math.max(0, count);
         return this;
     }
 
-    /**
-     * Set custom headers
-     */
-    public setHeaders(headers: Record<string, string>): this {
-        this.config.headers = { ...this.config.headers, ...headers };
-        return this;
-    }
-
-    /**
-     * Start uploading all files (similar to scrape() method)
-     */
-    public async upload(): Promise<UploadStats> {
+    public async push(): Promise<UploadStats> {
         if (this.files.size === 0) {
-            throw new Error('No files to upload');
+            throw new Error('TurboPush: No files to upload');
         }
 
         this.stats.startTime = Date.now();
         this.isPaused = false;
 
-        // Prepare chunks for all files
         for (const [fileId, file] of this.files) {
             this.fileChunks.set(fileId, this.createChunks(file));
         }
 
-        // Upload all files in parallel
-        const uploadPromises = Array.from(this.files.keys()).map(fileId => 
+        const uploadPromises = Array.from(this.files.keys()).map(fileId =>
             this.uploadFile(fileId)
         );
 
@@ -206,6 +170,7 @@ export class FileUploader {
 
         this.stats.endTime = Date.now();
         this.stats.duration = (this.stats.endTime - this.stats.startTime) / 1000;
+        this.stats.averageSpeed = this.stats.totalBytes / (this.stats.duration || 1);
 
         if (this.completeCallback) {
             this.completeCallback(this.stats);
@@ -214,31 +179,27 @@ export class FileUploader {
         return this.stats;
     }
 
-    /**
-     * Pause all uploads
-     */
+    public async upload(): Promise<UploadStats> {
+        return this.push();
+    }
+
     public pause(): void {
         this.isPaused = true;
-        // Abort all active uploads
-        for (const [fileId, controller] of this.activeUploads) {
+        for (const [key, controller] of this.activeUploads) {
             controller.abort();
-            const progress = this.fileProgress.get(fileId);
-            if (progress && progress.status === 'uploading') {
+        }
+        this.activeUploads.clear();
+        for (const progress of this.fileProgress.values()) {
+            if (progress.status === 'uploading') {
                 progress.status = 'paused';
             }
         }
-        this.activeUploads.clear();
     }
 
-    /**
-     * Resume uploads
-     */
     public async resume(): Promise<void> {
         this.isPaused = false;
-        
-        // Find files that were uploading or pending
         const filesToResume = Array.from(this.fileProgress.entries())
-            .filter(([_, progress]) => 
+            .filter(([_, progress]) =>
                 progress.status === 'paused' || progress.status === 'pending'
             )
             .map(([fileId, _]) => fileId);
@@ -247,9 +208,6 @@ export class FileUploader {
         await Promise.allSettled(uploadPromises);
     }
 
-    /**
-     * Cancel all uploads
-     */
     public cancel(): void {
         this.pause();
         this.files.clear();
@@ -257,23 +215,14 @@ export class FileUploader {
         this.fileChunks.clear();
     }
 
-    /**
-     * Get current statistics (similar to getStats in scraper)
-     */
     public getStats(): UploadStats {
         return { ...this.stats };
     }
 
-    /**
-     * Get progress for all files
-     */
     public getProgress(): UploadProgress[] {
         return Array.from(this.fileProgress.values());
     }
 
-    /**
-     * Get progress for a specific file
-     */
     public getFileProgress(fileName: string): UploadProgress | undefined {
         for (const progress of this.fileProgress.values()) {
             if (progress.fileName === fileName) {
@@ -283,101 +232,104 @@ export class FileUploader {
         return undefined;
     }
 
-    /* ========================================================================
-     * PRIVATE METHODS (Upload Engine - Similar to scraper's parallel download)
-     * ======================================================================== */
+    public isPausedState(): boolean {
+        return this.isPaused;
+    }
 
-    /**
-     * Upload a single file using parallel chunk uploads
-     */
+    public getQueueSize(): number {
+        return this.files.size;
+    }
+
     private async uploadFile(fileId: string): Promise<void> {
         const file = this.files.get(fileId);
         const chunks = this.fileChunks.get(fileId);
         const progress = this.fileProgress.get(fileId);
 
         if (!file || !chunks || !progress) {
-            throw new Error(`File not found: ${fileId}`);
+            throw new Error(`TurboPush: File not found: ${fileId}`);
         }
 
         progress.status = 'uploading';
         const startTime = Date.now();
         let lastUpdate = startTime;
+        let lastUploadedSize = 0;
 
         try {
-            // Upload chunks in parallel (similar to downloadInParallel)
             await this.uploadChunksInParallel(fileId, chunks, (uploadedChunks) => {
-                // Calculate progress
                 const uploadedSize = uploadedChunks * this.config.chunkSize;
                 progress.uploadedSize = Math.min(uploadedSize, file.size);
                 progress.percentage = (progress.uploadedSize / file.size) * 100;
 
-                // Calculate speed
                 const now = Date.now();
-                const timeDiff = (now - lastUpdate) / 1000; // seconds
-                if (timeDiff > 0) {
-                    progress.speed = (progress.uploadedSize - 
-                        (this.stats.uploadedBytes - progress.uploadedSize)) / timeDiff;
-                    progress.remainingTime = progress.speed > 0 
-                        ? (file.size - progress.uploadedSize) / progress.speed 
+                const timeDiff = (now - lastUpdate) / 1000;
+
+                if (timeDiff > 0.1) {
+                    const sizeDiff = progress.uploadedSize - lastUploadedSize;
+                    progress.speed = sizeDiff / timeDiff;
+                    progress.remainingTime = progress.speed > 0
+                        ? (file.size - progress.uploadedSize) / progress.speed
                         : 0;
                     lastUpdate = now;
+                    lastUploadedSize = progress.uploadedSize;
                 }
-
-                this.stats.uploadedBytes += this.config.chunkSize;
 
                 if (this.progressCallback) {
                     this.progressCallback(this.getProgress());
                 }
             });
 
-            // Finalize upload on server
             await this.finalizeUpload(fileId, file);
-
             progress.status = 'completed';
             progress.percentage = 100;
+            progress.uploadedSize = file.size;
             this.stats.completedFiles++;
 
+            if (this.fileCompleteCallback) {
+                this.fileCompleteCallback(file.name, fileId);
+            }
         } catch (error) {
             progress.status = 'failed';
+            progress.error = (error as Error).message;
             this.stats.failedFiles++;
-            
             if (this.errorCallback) {
-                this.errorCallback(error as Error, file.name);
+                this.errorCallback(error as Error, file.name, fileId);
             }
-            
             throw error;
         }
     }
 
-    /**
-     * Upload chunks in parallel (similar to downloadInParallel in scraper)
-     */
     private async uploadChunksInParallel(
         fileId: string,
         chunks: ChunkInfo[],
         progressCallback: (uploadedCount: number) => void
     ): Promise<void> {
-        const pendingChunks = chunks.filter(chunk => !chunk.uploaded);
+        const pendingChunks = [...chunks.filter(chunk => !chunk.uploaded)];
         let activeCount = 0;
-        let completedCount = 0;
+        let completedCount = chunks.filter(c => c.uploaded).length;
         let currentIndex = 0;
+        let hasError = false;
+        let errorMessage = '';
 
         return new Promise((resolve, reject) => {
             const uploadNext = async () => {
-                // Check if paused
-                if (this.isPaused) {
-                    return;
-                }
-
-                // Check if we're done
+                // Check for completion FIRST, before checking hasError or isPaused
+                // This ensures the promise resolves/rejects even when errors occur
                 if (currentIndex >= pendingChunks.length && activeCount === 0) {
-                    resolve();
+                    if (completedCount === chunks.length) {
+                        resolve();
+                    } else {
+                        reject(new Error(errorMessage || 'Some chunks failed'));
+                    }
                     return;
                 }
 
-                // Start new uploads up to max concurrent
-                while (activeCount < this.config.maxConcurrentUploads && 
-                       currentIndex < pendingChunks.length) {
+                // Now check if we should stop starting new uploads
+                if (this.isPaused || hasError) return;
+
+                while (activeCount < this.config.maxConcurrentUploads &&
+                       currentIndex < pendingChunks.length &&
+                       !this.isPaused && !hasError) {
+
                     const chunk = pendingChunks[currentIndex];
                     currentIndex++;
                     activeCount++;
@@ -386,40 +338,39 @@ export class FileUploader {
                         .then(() => {
                             chunk.uploaded = true;
                             completedCount++;
+                            this.stats.uploadedBytes += (chunk.end - chunk.start);
                             progressCallback(completedCount);
                         })
                         .catch((error) => {
-                            // Retry logic
                             if (chunk.attempts < this.config.maxRetries) {
                                 chunk.attempts++;
-                                pendingChunks.push(chunk); // Add back to queue
+                                pendingChunks.push(chunk);
                             } else {
-                                reject(new Error(`Failed to upload chunk ${chunk.index}: ${error.message}`));
+                                hasError = true;
+                                errorMessage = `Failed chunk ${chunk.index}: ${error.message}`;
                             }
                         })
                         .finally(() => {
                             activeCount--;
-                            uploadNext(); // Continue with next chunk
+                            uploadNext();
                         });
                 }
             };
-
-            // Start initial batch
             uploadNext();
         });
     }
 
-    /**
-     * Upload a single chunk with retry logic
-     */
     private async uploadChunk(fileId: string, chunk: ChunkInfo): Promise<void> {
         const file = this.files.get(fileId);
-        if (!file) {
-            throw new Error('File not found');
+        if (!file) throw new Error('TurboPush: File not found');
+
+        if (chunk.attempts > 0) {
+            await this.sleep(this.config.retryDelay * chunk.attempts);
         }
 
         const controller = new AbortController();
-        this.activeUploads.set(`${fileId}-${chunk.index}`, controller);
+        const uploadKey = `${fileId}-${chunk.index}`;
+        this.activeUploads.set(uploadKey, controller);
 
         try {
             const formData = new FormData();
@@ -430,6 +381,8 @@ export class FileUploader {
             formData.append('totalChunks', this.fileChunks.get(fileId)!.length.toString());
             formData.append('fileSize', file.size.toString());
 
+            const timeoutId = setTimeout(() => controller.abort(), this.config.timeout);
+
             const response = await fetch(this.config.endpoint, {
                 method: 'POST',
                 body: formData,
@@ -438,24 +391,26 @@ export class FileUploader {
                 signal: controller.signal
             });
 
+            clearTimeout(timeoutId);
+
             if (!response.ok) {
-                throw new Error(`Upload failed: ${response.statusText}`);
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
 
             const result = await response.json();
-            
             if (!result.success) {
                 throw new Error(result.error || 'Upload failed');
             }
-
+        } catch (error) {
+            if ((error as Error).name === 'AbortError') {
+                throw new Error('Upload timeout');
+            }
+            throw error;
         } finally {
-            this.activeUploads.delete(`${fileId}-${chunk.index}`);
+            this.activeUploads.delete(uploadKey);
         }
     }
 
-    /**
-     * Finalize upload - tell server to reassemble chunks
-     */
     private async finalizeUpload(fileId: string, file: File): Promise<void> {
         const response = await fetch(this.config.endpoint, {
             method: 'POST',
@@ -483,13 +438,6 @@ export class FileUploader {
         }
     }
 
-    /* ========================================================================
-     * UTILITY METHODS
-     * ======================================================================== */
-
-    /**
-     * Create chunks from a file
-     */
     private createChunks(file: File): ChunkInfo[] {
         const chunks: ChunkInfo[] = [];
         const totalChunks = Math.ceil(file.size / this.config.chunkSize);
@@ -497,7 +445,7 @@ export class FileUploader {
         for (let i = 0; i < totalChunks; i++) {
             const start = i * this.config.chunkSize;
             const end = Math.min(start + this.config.chunkSize, file.size);
-            
+
             chunks.push({
                 index: i,
                 start,
@@ -507,22 +455,18 @@ export class FileUploader {
                 uploaded: false
             });
         }
-
         return chunks;
     }
 
-    /**
-     * Generate unique ID for a file
-     */
     private generateFileId(file: File): string {
-        return `${file.name}-${file.size}-${file.lastModified}-${Date.now()}`;
+        const timestamp = Date.now();
+        const random = Math.random().toString(36).substring(2, 15);
+        return `${file.name.replace(/[^a-zA-Z0-9]/g, '_')}-${file.size}-${timestamp}-${random}`;
+    }
+
+    private sleep(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 }
 
-/* ========================================================================
- * JAVASCRIPT VERSION (For non-TypeScript projects)
- * ======================================================================== */
-
-// To use without TypeScript, simply remove all type annotations
-// The class will work identically in plain JavaScript
-
+export type { TurboPushConfig, UploadProgress, UploadStats };
