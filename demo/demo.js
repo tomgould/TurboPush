@@ -22,7 +22,7 @@ function initUploader() {
     uploader = new TurboPush({
         endpoint: '../examples/upload-endpoint.php',
         chunkSize: 1024 * 1024,        // 1MB chunks
-        maxConcurrentUploads: 5,       // 5 parallel uploads
+        maxConcurrentUploads: 12,       // 5 parallel uploads
         maxRetries: 3,                 // Retry failed chunks 3 times
         retryDelay: 1000               // 1s between retries
     });
