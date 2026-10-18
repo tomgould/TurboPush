@@ -2587,7 +2587,9 @@ export class TurboPush {
             return null;
         }
         try {
-            const digest = await subtle.digest(algorithm[1], await TurboPush.readBlob(blob));
+            // A view rather than the bare buffer: some Web Crypto implementations
+            // reject an ArrayBuffer from another realm (such as a FileReader's)
+            const digest = await subtle.digest(algorithm[1], new Uint8Array(await TurboPush.readBlob(blob)));
             return `${algorithm[0]} ${TurboPush.base64(new Uint8Array(digest))}`;
         } catch (error) {
             return null; // Checksums are optional: send the chunk without one
