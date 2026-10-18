@@ -269,9 +269,10 @@ class TurboPushEndpoint
      * Sets extensions that are always rejected
      *
      * By default this blocks extensions a web server may execute (php, phtml,
-     * phar, cgi, asp, jsp and similar). Pass an empty array to disable the
-     * blocklist, for example when uploads are stored outside the web root and
-     * an allowlist is in place.
+     * phar, cgi, asp, jsp and similar) and types a browser runs scripts in
+     * when served from your domain (html, htm, xhtml, svg and similar). Pass
+     * an empty array to disable the blocklist, for example when uploads are
+     * stored outside the web root and an allowlist is in place.
      *
      * @param array $extensions Array of blocked extensions without dots
      * @return $this Fluent interface for method chaining
