@@ -576,6 +576,24 @@ describe('TurboPush tus transport', () => {
             expect(await server.read(server.getUploads()[0].id)).toBe(content);
         });
 
+        test('retries when the offset check itself fails', async () => {
+            server = new TusMockServer();
+            server.start();
+            server.intercept(req => req.method === 'PATCH' && req.headers['upload-offset'] === '100'
+                ? TusMockServer.response(502) : undefined, 1);
+            server.intercept(req => req.method === 'HEAD' ? TusMockServer.response(503, {}, 'busy') : undefined, 1);
+            const turbopush = uploader(server);
+            const retries = jest.fn();
+            const { file, content } = patternFile(250);
+            turbopush.addFile(file).onRetry(retries);
+
+            await turbopush.push();
+
+            expect(retries.mock.calls.map(c => [c[0].error.status, c[0].error.message])).toEqual([[502, 'HTTP 502: Error'], [503, 'busy']]);
+            expect(server.getRequests('HEAD')).toHaveLength(2);
+            expect(await server.read(server.getUploads()[0].id)).toBe(content);
+        });
+
         test('creates a new upload when the old one is gone', async () => {
             server = new TusMockServer();
             server.start();
@@ -1140,6 +1158,248 @@ describe('TurboPush tus transport', () => {
             await delay(50);
 
             expect(server.getRequests('DELETE').map(r => r.url)).toEqual([`${TUS_BASE}u998`]);
+        });
+    });
+    describe('edge cases', () => {
+        test('encodes lone surrogates in metadata as U+FFFD', async () => {
+            server = new TusMockServer();
+            server.start();
+            const turbopush = uploader(server);
+            turbopush.addFile(new File(['x'], 'bad\uD800name.txt'));
+
+            await turbopush.push();
+
+            expect(metadataOf(server.getRequests('POST')[0].headers['upload-metadata']).filename).toBe('bad\uFFFDname.txt');
+        });
+
+        test('the client source parses in older browsers (no regex lookbehind)', () => {
+            const source = require('fs').readFileSync(require('path').join(__dirname, '..', 'TurboPush.ts'), 'utf8');
+            expect(source).not.toMatch(/\(\?<[=!]/);
+        });
+
+        test('push() after the recovery limit was hit starts with a fresh budget', async () => {
+            server = new TusMockServer();
+            server.start();
+            let lose = true;
+            server.intercept(req => {
+                if (lose && req.method === 'PATCH') {
+                    server.expire(req.id!);
+                    return TusMockServer.response(404);
+                }
+                return undefined;
+            });
+            const turbopush = uploader(server, { maxRetries: 10 });
+            const { file, content } = patternFile(150);
+            turbopush.addFile(file);
+
+            expect((await turbopush.push()).failedFiles).toBe(1);
+            lose = false;
+            const second = await turbopush.push();
+
+            expect(second.completedFiles).toBe(1);
+            const upload = server.getUploads()[server.getUploads().length - 1];
+            expect(await server.read(upload.id)).toBe(content);
+        });
+
+        test('a run of a chunk that was taken over by a new session sends nothing', async () => {
+            server = new TusMockServer({ extensions: ['creation', 'concatenation', 'checksum'], checksumAlgorithms: ['sha256'] });
+            server.start();
+            let calls = 0;
+            Object.defineProperty(window.crypto, 'subtle', {
+                value: {
+                    digest: async (algorithm: string, data: ArrayBuffer) => {
+                        calls++;
+                        if (calls === 2) {
+                            await delay(80); // Still hashing when the file fails
+                        }
+                        return webcrypto.subtle.digest(algorithm, new Uint8Array(data));
+                    }
+                },
+                configurable: true
+            });
+            try {
+                let failOnce = true;
+                server.intercept(req => {
+                    if (failOnce && req.method === 'PATCH') {
+                        failOnce = false;
+                        return TusMockServer.response(400, {}, 'bad');
+                    }
+                    return undefined;
+                });
+                const turbopush = uploader(server, { maxConcurrentUploads: 2 });
+                const { file, content } = patternFile(200);
+                turbopush.addFile(file);
+
+                expect((await turbopush.push()).failedFiles).toBe(1);
+                const second = await turbopush.push();
+                await delay(150);
+
+                expect(second.completedFiles).toBe(1);
+                // The failed PATCH, then one per part: the old run of the second part sent nothing
+                expect(server.getRequests('PATCH')).toHaveLength(3);
+                expect(server.getRequests('HEAD')).toHaveLength(1);
+                expect(turbopush.getStats().uploadedBytes).toBe(200);
+                const final = server.getUploads().find(u => u.final)!;
+                expect(await server.read(final.id)).toBe(content);
+            } finally {
+                delete (window.crypto as any).subtle;
+            }
+        });
+
+        test('a creation answer that arrives as the request is paused keeps its upload', async () => {
+            server = new TusMockServer();
+            server.start();
+            const turbopush = uploader(server);
+            server.intercept(req => {
+                if (req.method === 'POST') {
+                    turbopush.pause(); // Aborts the request, but the answer is already here
+                    return TusMockServer.response(201, { Location: `${TUS_BASE}kept` });
+                }
+                return undefined;
+            }, 1);
+            server.intercept(req => req.method === 'HEAD' && req.id === 'kept'
+                ? TusMockServer.response(200, { 'Upload-Offset': 0, 'Upload-Length': 200 }) : undefined);
+            server.intercept(req => req.method === 'PATCH' && req.id === 'kept'
+                ? TusMockServer.response(204, { 'Upload-Offset': Number(req.headers['upload-offset']) + req.body!.size })
+                : undefined);
+            turbopush.addFile(patternFile(200).file);
+
+            const done = turbopush.push();
+            await delay(50);
+            await turbopush.resume();
+            const stats = await done;
+
+            expect(stats.completedFiles).toBe(1);
+            expect(server.getRequests('POST')).toHaveLength(1);
+            expect(turbopush.getProgress()[0].result!.uploadUrl).toBe(`${TUS_BASE}kept`);
+        });
+
+        test('cancel during a creation request deletes the upload it created', async () => {
+            server = new TusMockServer({ extensions: ['creation', 'termination'] });
+            server.start();
+            const turbopush = uploader(server);
+            turbopush.addFile(patternFile(200).file);
+            await turbopush.push(); // Learn the capabilities
+            server.intercept(req => {
+                if (req.method === 'POST') {
+                    turbopush.cancel();
+                    return TusMockServer.response(201, { Location: `${TUS_BASE}orphan` });
+                }
+                return undefined;
+            }, 1);
+            turbopush.addFile(patternFile(200, 'b.txt').file);
+
+            const stats = await turbopush.push();
+            await delay(20);
+
+            expect(stats.cancelled).toBe(true);
+            expect(server.getRequests('DELETE').map(r => r.url)).toEqual([`${TUS_BASE}orphan`]);
+        });
+
+        test('a PATCH answered with 403 checks the upload and creates it again', async () => {
+            server = new TusMockServer();
+            server.start();
+            server.intercept(req => {
+                if (req.method === 'PATCH' && req.headers['upload-offset'] === '100') {
+                    server.expire(req.id!);
+                    return TusMockServer.response(403);
+                }
+                return undefined;
+            }, 1);
+            const turbopush = uploader(server);
+            const { file, content } = patternFile(200);
+            turbopush.addFile(file);
+
+            const stats = await turbopush.push();
+
+            expect(stats.completedFiles).toBe(1);
+            expect(server.getRequests('POST')).toHaveLength(2);
+            expect(await server.read(server.getUploads()[0].id)).toBe(content);
+        });
+
+        test('a timed-out request that made progress does not use up the retries', async () => {
+            server = new TusMockServer();
+            server.start();
+            // A slow connection: every PATCH longer than 25 bytes gets 25 bytes
+            // through before it drops, so each chunk needs four attempts
+            server.intercept(req => {
+                if (req.method === 'PATCH' && req.body!.size > 25) {
+                    server.storePart(req, 25);
+                    throw new Error('Connection reset');
+                }
+                return undefined;
+            });
+            const turbopush = uploader(server, { maxRetries: 1 });
+            const { file, content } = patternFile(400);
+            turbopush.addFile(file);
+
+            const stats = await turbopush.push();
+
+            expect(stats.completedFiles).toBe(1);
+            expect(await server.read(server.getUploads()[0].id)).toBe(content);
+        });
+
+        test('a final request the server rejects resets the file, deleting the parts', async () => {
+            server = new TusMockServer({ extensions: ['creation', 'termination', 'concatenation'] });
+            server.start();
+            server.intercept(req => (req.headers['upload-concat'] || '').startsWith('final;')
+                ? TusMockServer.response(400, {}, 'bad final request') : undefined, 1);
+            const turbopush = uploader(server, { maxConcurrentUploads: 2 });
+            const { file, content } = patternFile(400);
+            turbopush.addFile(file);
+
+            const first = await turbopush.push();
+            await delay(20);
+            expect(first.failedFiles).toBe(1);
+            expect(server.getRequests('DELETE')).toHaveLength(2);
+            expect(turbopush.getStats().uploadedBytes).toBe(0);
+
+            const second = await turbopush.push();
+            expect(second.completedFiles).toBe(1);
+            const final = server.getUploads().find(u => u.final)!;
+            expect(await server.read(final.id)).toBe(content);
+        });
+
+        test('a saved parallel plan is dropped when concatenation is no longer used', async () => {
+            const key = `turbopush:tus:${TUS_BASE}:pattern.txt:400:1000`;
+            const saved = JSON.stringify({
+                v: 1, fileId: 'saved', parallel: true,
+                lanes: [{ url: `${TUS_BASE}p1`, start: 0, end: 200 }, { url: `${TUS_BASE}p2`, start: 200, end: 400 }]
+            });
+
+            // The options now say no parallel uploads
+            server = new TusMockServer({ extensions: ['creation', 'termination', 'concatenation'] });
+            server.start();
+            localStorage.setItem(key, saved);
+            const optedOut = uploader(server, { resumable: true, tus: { parallel: false } });
+            optedOut.addFile(patternFile(400).file);
+            expect((await optedOut.push()).completedFiles).toBe(1);
+            await delay(20);
+            expect(server.getRequests('HEAD')).toHaveLength(0);
+            expect(server.getRequests('DELETE').map(r => r.url)).toEqual([`${TUS_BASE}p1`, `${TUS_BASE}p2`]);
+            expect(server.getRequests('POST').every(p => p.headers['upload-concat'] === undefined)).toBe(true);
+            server.stop();
+
+            // The server no longer offers concatenation
+            server = new TusMockServer({ extensions: ['creation'] });
+            server.start();
+            localStorage.setItem(key, saved);
+            const unsupported = uploader(server, { resumable: true });
+            unsupported.addFile(patternFile(400).file);
+            expect((await unsupported.push()).completedFiles).toBe(1);
+            expect(server.getRequests('HEAD')).toHaveLength(0);
+            expect(server.getRequests('POST')).toHaveLength(1);
+        });
+
+        test('saved upload URLs on another origin are ignored', () => {
+            localStorage.setItem(`turbopush:tus:${TUS_BASE}:pattern.txt:200:1000`, JSON.stringify({
+                v: 1, fileId: 'elsewhere', parallel: false, lanes: [{ url: 'https://evil.example/files/x', start: 0, end: 200 }]
+            }));
+            server = new TusMockServer();
+            const turbopush = uploader(server, { resumable: true });
+            turbopush.addFile(patternFile(200).file);
+
+            expect(turbopush.getProgress()[0].fileId).not.toBe('elsewhere');
         });
     });
 });

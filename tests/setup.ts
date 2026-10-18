@@ -11,6 +11,13 @@
  * @since 1.0.0
  */
 
+import { TextEncoder } from 'util';
+
+// jsdom lacks TextEncoder, which every supported browser and Node have
+if (typeof (globalThis as any).TextEncoder === 'undefined') {
+    (globalThis as any).TextEncoder = TextEncoder;
+}
+
 beforeEach(() => {
     localStorage.clear();
 });

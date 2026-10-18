@@ -716,7 +716,7 @@ export class TurboPush {
         // In resumable mode, reuse the ID of an earlier, unfinished upload of this file
         if (this.config.resumable && this.config.protocol === 'tus') {
             // tus: the saved state holds the upload URLs; it is written once an upload exists
-            const saved = TurboPush.parseSavedTus(this.storageGet(this.storageKey(file)), file.size);
+            const saved = TurboPush.parseSavedTus(this.storageGet(this.storageKey(file)), file.size, this.endpointOrigin());
             if (saved && !this.entries.has(saved.fileId)) {
                 fileId = saved.fileId;
                 restored = true;
@@ -1277,12 +1277,15 @@ export class TurboPush {
                     ? this.tusPlan(entry)
                     : this.createChunks(entry.file, entry.chunkSize);
             }
-            // Give every unfinished chunk a fresh retry budget
+            // Give every unfinished chunk (and tus upload) a fresh retry budget
             for (const chunk of entry.chunks) {
                 chunk.attempts = 0;
                 if (chunk.state !== 'done') {
                     chunk.state = 'pending';
                 }
+            }
+            for (const lane of entry.tus ? entry.tus.lanes : []) {
+                lane.recoveries = 0;
             }
             entry.progress.status = 'pending';
             session.fileIds.push(fileId);
@@ -1598,9 +1601,11 @@ export class TurboPush {
      * @private
      */
     private resetLostChunks(entry: FileEntry, error: TurboPushError): void {
-        // tus: the partial uploads expired before they were joined, start over
+        // tus: the server would not join the partial uploads (they expired, or
+        // it rejects the final request): start over on the next push()
         if (entry.tus) {
-            if (error.status === 404 || error.status === 410) {
+            if (entry.tus.parallel && !error.retryable && error.code !== 'cancelled') {
+                this.tusTerminate(entry);
                 this.tusReset(entry);
             }
             return;
@@ -1927,6 +1932,8 @@ export class TurboPush {
      * @param {RequestInit} init - Fetch options
      * @param {number | undefined} chunkIndex - Chunk index, for error details
      * @param {Function} read - Reads the response body
+     * @param {boolean} [keepLate] - Return a response that arrived in full
+     *   even if the request was aborted meanwhile
      * @returns {Promise<{ response: Response, body: T }>} The response and its body
      */
     private async send<T>(
@@ -1936,7 +1943,8 @@ export class TurboPush {
         url: string,
         init: RequestInit,
         chunkIndex: number | undefined,
-        read: (response: Response) => Promise<T>
+        read: (response: Response) => Promise<T>,
+        keepLate: boolean = false
     ): Promise<{ response: Response; body: T }> {
         // Create AbortController for timeout/cancellation
         const controller = new AbortController();
@@ -1967,7 +1975,7 @@ export class TurboPush {
             }
 
             const aborted = this.abortError(record, chunkIndex);
-            if (aborted) {
+            if (aborted && !keepLate) {
                 throw aborted;
             }
 
@@ -2061,10 +2069,22 @@ export class TurboPush {
      */
     private tusPlan(entry: FileEntry): ChunkInfo[] {
         const size = entry.file.size;
+        const concatenation = this.tusCaps().extensions.includes('concatenation');
+
+        // A restored parallel plan needs concatenation, still allowed by the
+        // options and still offered by the server (if it answered OPTIONS)
+        if (entry.tus && entry.tus.parallel
+            && (!this.config.tus.parallel || (this.tusCapabilities !== null && !concatenation))) {
+            this.tusTerminate(entry);
+            this.storageRemove(entry);
+            entry.tus = null;
+            entry.restored = false;
+        }
+
         if (!entry.tus) {
             const chunkCount = Math.max(1, Math.ceil(size / entry.chunkSize));
             const parallel = this.config.tus.parallel
-                && this.tusCaps().extensions.includes('concatenation')
+                && concatenation
                 && chunkCount > 1
                 && this.config.maxConcurrentUploads > 1;
             const laneCount = parallel ? Math.min(this.config.maxConcurrentUploads, chunkCount) : 1;
@@ -2096,27 +2116,33 @@ export class TurboPush {
      */
     private async tusUploadChunk(entry: FileEntry, chunk: ChunkInfo): Promise<void> {
         const lane = entry.tus!.lanes[chunk.lane];
-        const key = `${entry.progress.fileId}:${chunk.index}`;
+        // The token tells this run of the chunk apart from a later one, and
+        // makes the in-flight key unique so pause() and cancel() reach it
+        const token = chunk.token;
+        const key = `${entry.progress.fileId}:${chunk.index}:${token}`;
 
         while (chunk.state !== 'done') {
-            this.tusCheckActive(entry, chunk);
+            this.tusCheckActive(entry, chunk, token);
             if (lane.url === null) {
                 await this.tusCreate(entry, chunk, key);
             } else if (!lane.synced) {
                 await this.tusSync(entry, chunk, key);
             } else {
-                await this.tusPatch(entry, chunk, key);
+                await this.tusPatch(entry, chunk, key, token);
             }
         }
     }
 
     /**
-     * Stops a tus chunk between requests if it was paused, cancelled or its file failed
+     * Stops a tus chunk between requests if it was paused, cancelled or its
+     * file failed, or if a newer run of the chunk has taken over
      *
      * @private
      */
-    private tusCheckActive(entry: FileEntry, chunk: ChunkInfo): void {
-        if (this.entries.get(entry.progress.fileId) !== entry || entry.progress.status === 'failed') {
+    private tusCheckActive(entry: FileEntry, chunk: ChunkInfo, token: number): void {
+        if (this.entries.get(entry.progress.fileId) !== entry
+            || entry.progress.status === 'failed'
+            || chunk.token !== token) {
             throw new TurboPushError('Upload cancelled', { code: 'cancelled', retryable: false, chunkIndex: chunk.index });
         }
         if (this.isPaused) {
@@ -2148,15 +2174,25 @@ export class TurboPush {
             headers['Upload-Concat'] = 'partial';
         }
 
+        // Keep an answer that arrives just as the request is aborted: the
+        // server has created the upload, so its URL must not be lost
         const { response, body } = await this.send(entry.progress.fileId, key, 'chunk', this.config.endpoint, {
             method: 'POST',
             headers: this.tusHeaders(headers)
-        }, chunk.index, TurboPush.readText);
+        }, chunk.index, TurboPush.readText, true);
 
         if (!response.ok) {
             throw TurboPush.tusError(response, body, chunk.index, TurboPush.tusRetryable(response.status, false));
         }
-        lane.url = this.tusLocation(response, chunk.index);
+        const url = this.tusLocation(response, chunk.index);
+
+        // Cancelled meanwhile: delete what was just created
+        if (this.entries.get(entry.progress.fileId) !== entry) {
+            this.tusDelete([url]);
+            throw new TurboPushError('Upload cancelled', { code: 'cancelled', retryable: false, chunkIndex: chunk.index });
+        }
+
+        lane.url = url;
         lane.synced = true;
         this.tusSave(entry);
         this.tusRealign(entry, chunk, lane.start);
@@ -2189,6 +2225,12 @@ export class TurboPush {
             return;
         }
 
+        // The failed request still got data through (a slow connection that
+        // timed out, say): that is progress, so the retry budget starts again
+        if (position > chunk.start) {
+            chunk.attempts = 0;
+        }
+
         lane.synced = true;
         this.tusRealign(entry, chunk, position);
     }
@@ -2198,7 +2240,7 @@ export class TurboPush {
      *
      * @private
      */
-    private async tusPatch(entry: FileEntry, chunk: ChunkInfo, key: string): Promise<void> {
+    private async tusPatch(entry: FileEntry, chunk: ChunkInfo, key: string, token: number): Promise<void> {
         const lane = entry.tus!.lanes[chunk.lane];
         const start = chunk.start;
         const headers: Record<string, string> = {
@@ -2209,7 +2251,7 @@ export class TurboPush {
         if (checksum) {
             headers['Upload-Checksum'] = checksum;
         }
-        this.tusCheckActive(entry, chunk);
+        this.tusCheckActive(entry, chunk, token);
 
         try {
             const { response, body } = await this.send(entry.progress.fileId, key, 'chunk', lane.url!, {
@@ -2432,11 +2474,19 @@ export class TurboPush {
      * @private
      */
     private tusTerminate(entry: FileEntry): void {
+        const tus = entry.tus!;
+        this.tusDelete(tus.lanes.map(lane => lane.url).concat(tus.finalUrl));
+    }
+
+    /**
+     * Deletes tus uploads by URL (best effort), if the server supports termination
+     *
+     * @private
+     */
+    private tusDelete(urls: (string | null)[]): void {
         if (!this.tusCaps().extensions.includes('termination')) {
             return;
         }
-        const tus = entry.tus!;
-        const urls = tus.lanes.map(lane => lane.url).concat(tus.finalUrl);
         for (const url of urls) {
             if (url === null) {
                 continue;
@@ -2615,9 +2665,9 @@ export class TurboPush {
 
     /**
      * Whether a tus error status is worth retrying
-     * PATCH failures are also retried on 404/410 (the next attempt checks the
-     * upload and recreates it if it is gone), 409 (offset mismatch, the next
-     * attempt asks for the offset) and 460 (checksum mismatch)
+     * PATCH failures are also retried on 403/404/410 (the next attempt checks
+     * the upload and recreates it if it is gone), 409 (offset mismatch, the
+     * next attempt asks for the offset) and 460 (checksum mismatch)
      *
      * @private
      */
@@ -2625,7 +2675,7 @@ export class TurboPush {
         if (status === 408 || status === 423 || status === 429 || status >= 500) {
             return true;
         }
-        return patch && (status === 404 || status === 409 || status === 410 || status === 460);
+        return patch && (status === 403 || status === 404 || status === 409 || status === 410 || status === 460);
     }
 
     /**
@@ -2665,11 +2715,13 @@ export class TurboPush {
 
     /**
      * Parses and checks a saved tus upload
-     * Returns null unless it is well formed and its lanes cover the whole file
+     * Returns null unless it is well formed, its lanes cover the whole file
+     * and its upload URLs are on the endpoint's origin (so the configured
+     * headers, which may carry credentials, never go anywhere else)
      *
      * @private
      */
-    private static parseSavedTus(value: string | null, size: number): SavedTusUpload | null {
+    private static parseSavedTus(value: string | null, size: number, origin: string | null): SavedTusUpload | null {
         if (value === null) {
             return null;
         }
@@ -2687,7 +2739,7 @@ export class TurboPush {
         let expected = 0;
         for (const lane of saved.lanes) {
             const urlValid = lane && (lane.url === null || (typeof lane.url === 'string' && /^https?:\/\//i.test(lane.url)
-                && lane.url.length <= 2048));
+                && lane.url.length <= 2048 && TurboPush.originOf(lane.url) === origin));
             if (!urlValid || !Number.isSafeInteger(lane.start) || !Number.isSafeInteger(lane.end)
                 || lane.start !== expected || lane.end < lane.start || (lane.end === lane.start && size > 0)) {
                 return null;
@@ -2695,6 +2747,29 @@ export class TurboPush {
             expected = lane.end;
         }
         return expected === size ? saved as SavedTusUpload : null;
+    }
+
+    /**
+     * Gets the origin of the endpoint, resolved against the page, or null
+     *
+     * @private
+     */
+    private endpointOrigin(): string | null {
+        const page = (globalThis as { location?: { href?: string } }).location?.href;
+        return TurboPush.originOf(this.config.endpoint, page);
+    }
+
+    /**
+     * Gets the origin of a URL, or null if it cannot be parsed
+     *
+     * @private
+     */
+    private static originOf(url: string, base?: string): string | null {
+        try {
+            return new URL(url, base).origin;
+        } catch (error) {
+            return null;
+        }
     }
 
     /**
@@ -2737,11 +2812,8 @@ export class TurboPush {
      * @private
      */
     private static base64Utf8(value: string): string {
-        // Replace lone surrogates, which encodeURIComponent rejects
-        const wellFormed = value.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
-        const binary = encodeURIComponent(wellFormed)
-            .replace(/%([0-9A-F]{2})/g, (match, hex: string) => String.fromCharCode(parseInt(hex, 16)));
-        return btoa(binary);
+        // TextEncoder replaces lone surrogates with U+FFFD
+        return TurboPush.base64(new TextEncoder().encode(value));
     }
 
     /**
