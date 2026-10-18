@@ -18,7 +18,7 @@ namespace TurboPush;
  * - Temporary chunks kept outside the web root by default, with automatic
  *   cleanup of abandoned uploads
  * - Status and abort actions for resuming and cancelling uploads
- * - Configurable CORS
+ * - Same-origin only by default, with an optional CORS origin allowlist
  * - Optional logging
  *
  * @package    TurboPush
@@ -156,10 +156,10 @@ class TurboPushEndpoint
     private $cleanupProbability = 0.01;
 
     /**
-     * Origins allowed to call the endpoint cross-origin (['*'] = any, [] = no CORS headers)
+     * Origins allowed to call the endpoint cross-origin ([] = same-origin only, ['*'] = any)
      * @var array
      */
-    private $allowedOrigins = ['*'];
+    private $allowedOrigins = [];
 
     /**
      * Path to log file (null = logging disabled)
@@ -393,28 +393,40 @@ class TurboPushEndpoint
     /**
      * Sets the origins allowed to call the endpoint cross-origin
      *
-     * ['*'] (the default) allows any origin without credentials. A list of
-     * origins allows only those, with credentials, and rejects requests from
-     * other origins with 403 (same-origin requests are always allowed). An
-     * empty array sends no CORS headers at all.
+     * By default (or with an empty array) the endpoint is same-origin only:
+     * it sends no CORS headers and rejects browser requests from other
+     * origins with 403. A list of origins allows those as well, with
+     * credentials: their requests (including preflights) get
+     * Access-Control-Allow-Origin set to the matching entry, and responses
+     * carry Vary: Origin. ['*'] allows any origin, without credentials.
      *
-     * @param array $origins Origins such as ['https://app.example.com']
+     * Same-origin requests and requests without an Origin header (non-browser
+     * clients) are always allowed.
+     *
+     * @param array|string $origins Origins such as ['https://app.example.com'], or ['*']
      * @return $this Fluent interface for method chaining
+     * @throws \InvalidArgumentException If an entry is not '*' or a scheme://host[:port] origin
      *
      * @example
      * ```php
-     * $endpoint->setAllowedOrigins(['https://app.example.com']);
+     * $endpoint->setAllowedOrigins(['https://app.example.com', 'https://admin.example.com']);
      * ```
      */
     public function setAllowedOrigins($origins) {
         $normalized = [];
         foreach ((array) $origins as $origin) {
             $origin = strtolower(rtrim(trim((string) $origin), '/'));
-            if ($origin !== '') {
-                $normalized[] = $origin;
+            if ($origin === '') {
+                continue;
             }
+            if ($origin !== '*' && !$this->isValidOrigin($origin)) {
+                // Catches typos such as a missing scheme or a path, which would
+                // never match, and 'null', which any sandboxed page can send
+                throw new \InvalidArgumentException('Invalid origin: ' . $origin);
+            }
+            $normalized[] = $origin;
         }
-        $this->allowedOrigins = $normalized;
+        $this->allowedOrigins = array_values(array_unique($normalized));
         return $this;
     }
 
@@ -502,17 +514,17 @@ class TurboPushEndpoint
         try {
             $method = isset($server['REQUEST_METHOD']) ? strtoupper($server['REQUEST_METHOD']) : 'GET';
 
-            // Handle CORS preflight requests
-            if ($method === 'OPTIONS') {
-                return ['status' => 204, 'headers' => [], 'body' => null];
-            }
-
-            if ($method !== 'POST') {
+            if ($method !== 'POST' && $method !== 'OPTIONS') {
                 throw new TurboPushException('Method not allowed', 405);
             }
 
             if (!$this->isOriginAllowed($server)) {
                 throw new TurboPushException('Origin not allowed', 403);
+            }
+
+            // Answer CORS preflight requests (the CORS headers are added by processRequest())
+            if ($method === 'OPTIONS') {
+                return ['status' => 204, 'headers' => [], 'body' => null];
             }
 
             $this->maybeCleanup();
@@ -1745,6 +1757,10 @@ class TurboPushEndpoint
     /**
      * Builds the CORS headers for a response
      *
+     * Same-origin only (the default): none. ['*']: Access-Control-Allow-Origin: *
+     * without credentials. A list: the matching entry with credentials, and
+     * Vary: Origin on every response because the headers depend on the Origin.
+     * The header value always comes from the list, never from the request.
      * See setAllowedOrigins().
      *
      * @param array $server Server parameters
@@ -1767,10 +1783,11 @@ class TurboPushEndpoint
             return ['Access-Control-Allow-Origin' => '*'] + $allow;
         }
 
-        $origin = isset($server['HTTP_ORIGIN']) ? rtrim((string) $server['HTTP_ORIGIN'], '/') : '';
-        if ($origin !== '' && in_array(strtolower($origin), $this->allowedOrigins, true)) {
+        $origin = $this->requestOrigin($server);
+        $index = $origin !== '' ? array_search($origin, $this->allowedOrigins, true) : false;
+        if ($index !== false) {
             return [
-                'Access-Control-Allow-Origin' => $origin,
+                'Access-Control-Allow-Origin' => $this->allowedOrigins[$index],
                 'Access-Control-Allow-Credentials' => 'true',
                 'Vary' => 'Origin',
             ] + $allow;
@@ -1783,7 +1800,12 @@ class TurboPushEndpoint
      * Checks the Origin header against the allowed origins
      *
      * Requests without an Origin header (non-browser clients) and
-     * same-origin requests are always allowed.
+     * same-origin requests are always allowed. Other origins must be on
+     * the list, unless it contains '*'.
+     *
+     * Same-origin means the Origin's host and port match the Host header.
+     * The scheme is only compared when PHP itself received the request over
+     * HTTPS, because behind a TLS-terminating proxy PHP sees plain HTTP.
      *
      * @param array $server Server parameters
      * @return bool
@@ -1791,21 +1813,60 @@ class TurboPushEndpoint
      * @private
      */
     private function isOriginAllowed(array $server) {
-        if (empty($this->allowedOrigins) || in_array('*', $this->allowedOrigins, true)) {
+        if (in_array('*', $this->allowedOrigins, true)) {
             return true;
         }
 
-        $origin = isset($server['HTTP_ORIGIN']) ? strtolower(rtrim((string) $server['HTTP_ORIGIN'], '/')) : '';
+        $origin = $this->requestOrigin($server);
         if ($origin === '' || in_array($origin, $this->allowedOrigins, true)) {
             return true;
+        }
+
+        if (!$this->isValidOrigin($origin) || !isset($server['HTTP_HOST'])) {
+            return false;
+        }
+
+        $https = isset($server['HTTPS']) && $server['HTTPS'] !== '' && strtolower((string) $server['HTTPS']) !== 'off';
+        if ($https && parse_url($origin, PHP_URL_SCHEME) !== 'https') {
+            return false;
         }
 
         $host = parse_url($origin, PHP_URL_HOST);
         $port = parse_url($origin, PHP_URL_PORT);
         $originHost = $port ? $host . ':' . $port : $host;
 
-        return isset($server['HTTP_HOST']) && is_string($originHost)
-            && strcasecmp($originHost, (string) $server['HTTP_HOST']) === 0;
+        return is_string($originHost) && strcasecmp($originHost, (string) $server['HTTP_HOST']) === 0;
+    }
+
+    /**
+     * Returns the request's Origin header, normalized for comparison
+     *
+     * @param array $server Server parameters
+     * @return string Lowercased origin without a trailing slash, or '' if none
+     *
+     * @private
+     */
+    private function requestOrigin(array $server) {
+        return isset($server['HTTP_ORIGIN']) ? strtolower(rtrim(trim((string) $server['HTTP_ORIGIN']), '/')) : '';
+    }
+
+    /**
+     * Checks that a normalized value is a serialized origin: scheme://host[:port]
+     *
+     * No path, query, credentials or wildcards: browsers send the origin in
+     * exactly this form (with IDN hosts in punycode), and entries are
+     * compared as plain strings.
+     *
+     * @param string $origin Lowercased origin without a trailing slash
+     * @return bool
+     *
+     * @private
+     */
+    private function isValidOrigin($origin) {
+        return (bool) preg_match(
+            '#^[a-z][a-z0-9+.-]*://(?:[a-z0-9_-]+(?:\.[a-z0-9_-]+)*|\[[0-9a-f:.]+\])(?::[0-9]{1,5})?$#D',
+            $origin
+        );
     }
 
     /**

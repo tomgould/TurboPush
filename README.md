@@ -70,7 +70,7 @@ use TurboPush\TurboPushEndpoint;
 | `maxRetryDelay` | number | `30000` | Upper limit for the retry delay in ms |
 | `timeout` | number | `30000` | Per-request timeout in ms (minimum 5000). Timed-out requests are retried |
 | `headers` | object | `{}` | Extra headers for every request, such as a CSRF token |
-| `withCredentials` | boolean | `false` | Send cookies with cross-origin requests |
+| `withCredentials` | boolean | `false` | Send cookies with cross-origin requests. The page's origin must be listed in the endpoint's `setAllowedOrigins()` |
 | `resumable` | boolean | `false` | Remember uploads in `localStorage` and continue them after a page reload |
 
 ### Methods
@@ -144,7 +144,7 @@ With `resumable: true`, each file's upload ID is stored in `localStorage` under 
 | `setAllowedMimeTypes(array)` | `[]` (not checked) | Allowlist checked against the type detected from the file's contents. Wildcards such as `image/*` work. Needs `ext-fileinfo` |
 | `setFileValidator(callable)` | none | `function ($path, $info)`: inspect the assembled file before it is stored. Return `false` to reject with 415, or throw `TurboPushException` to choose the message and status |
 | `onComplete(callable)` | none | `function ($path, $info)`: called after the file is stored. Return an array to add fields to the response. If it throws, the file is removed and the chunks kept so the client can retry |
-| `setAllowedOrigins(array)` | `['*']` | CORS. A list of origins allows only those (with credentials) and rejects other origins with 403. `[]` sends no CORS headers |
+| `setAllowedOrigins(array)` | `[]` (same-origin only) | Other origins allowed to call the endpoint, such as `['https://app.example.com']`. They get CORS headers with credentials. `['*']` allows any origin, without credentials. See CORS below |
 | `setUploadTtl($seconds)` | 86400 | Abandoned uploads are deleted after this long without activity |
 | `setCleanupProbability($p)` | 0.01 | Share of requests that also run `cleanup()`. Set to 0 and call `cleanup()` from cron if you prefer |
 | `enableLogging($file)` | off | Log file for activity and internal error details |
@@ -181,7 +181,7 @@ All requests are `POST` to the endpoint. Responses are JSON: `{"success": bool, 
 | 200 | Success |
 | 204 | CORS preflight |
 | 400 | Malformed request: missing field, invalid ID or index, inconsistent sizes |
-| 403 | Origin not allowed |
+| 403 | Browser request (or preflight) from an origin that is not allowed |
 | 404 | Unknown upload (finalize or status) |
 | 405 | Method other than POST or OPTIONS |
 | 409 | Conflicts with the upload so far: metadata differs from earlier chunks, chunks missing at finalize (listed in `data.missingChunks`), upload already finalized, cancelled or expired |
@@ -192,13 +192,13 @@ All requests are `POST` to the endpoint. Responses are JSON: `{"success": bool, 
 ## Security notes
 
 - **Authenticate first.** Anyone who can reach the endpoint can upload. Check the session or token before calling `handle()`, and add rate limiting at the web server or application level.
-- **CSRF.** If you authenticate with cookies, protect against cross-site requests. JSON actions (finalize, status, abort) must use `Content-Type: application/json`, so browsers have to send a CORS preflight for them, but chunk uploads are ordinary multipart posts. Send a CSRF token in `headers` and check it, or use `setAllowedOrigins()` so requests from other sites are rejected.
+- **CSRF.** If you authenticate with cookies, protect against cross-site requests. The endpoint rejects browser requests from origins you have not allowed, including chunk uploads, which are ordinary multipart posts that need no preflight. That check relies on the `Origin` header, so for defence in depth also send a CSRF token in `headers` and check it. Do not use `setAllowedOrigins(['*'])` with cookie authentication.
 - **Keep files out of the web root.** Store uploads where the web server will not serve or execute them, and serve them through your application. If they must be public, serve them from a separate domain or with `Content-Disposition: attachment`, because uploaded HTML or SVG can run scripts on your origin.
 - **Allowlist what you expect.** Executable extensions are blocked by default, but an extension allowlist plus `setAllowedMimeTypes()` is much stronger. The MIME type is detected from the contents, not taken from the client. Use `setFileValidator()` for deeper checks such as virus scanning.
 - **Limits.** Uploads above `setMaxFileSize()` are refused on the first chunk. A client cannot store more bytes than it declared, more chunks than `setMaxChunks()`, or chunks above `setMaxChunkSize()`. Set PHP's `upload_max_filesize` and `post_max_size` just above the client's `chunkSize`. Assembling a very large file takes time, so check `max_execution_time`.
 - **Temp directory.** Chunks go to a folder under `sys_get_temp_dir()` named after a hash of the upload directory, created with mode 0700, so they are never in the web root. Because that location is shared, the endpoint refuses to use the folder if it is a symlink or other users can access it. If you set your own, keep it outside the web root and on a local disk: per-upload locking uses `flock()`, which is unreliable on NFS. On systems where `/tmp` is a RAM-backed tmpfs, set a temp directory on disk so large uploads do not fill memory. Abandoned uploads are deleted after `setUploadTtl()`.
 - **File names.** Names are reduced to letters, digits, dots, dashes and underscores. Leading and trailing dots are removed (no `.htaccess` or `.user.ini`), inner executable extensions are neutralised (`shell.php.jpg` becomes `shell_php.jpg`), and an existing file is never overwritten: the new file gets a `_<timestamp>` suffix. The stored name is returned to the client.
-- **CORS.** The default `Access-Control-Allow-Origin: *` keeps 1.0 behaviour. In production, call `setAllowedOrigins()` with your site's origin.
+- **CORS.** The endpoint is same-origin only by default: it sends no CORS headers and answers browser requests from other origins, preflights included, with 403. Requests without an `Origin` header (curl, server-to-server) are allowed. If the upload page is on another origin, list it with `setAllowedOrigins(['https://app.example.com', ...])`: those origins get `Access-Control-Allow-Origin` set to their own origin, with credentials, and responses carry `Vary: Origin`. Entries must be exact `scheme://host[:port]` origins; anything else throws. `['*']` allows any origin without credentials and has to be set explicitly. Same-origin is judged by comparing the `Origin` header with the `Host` header, so if a proxy in front of PHP rewrites `Host`, add your site's own origin to the list.
 - **Errors and logs.** Error responses never include server paths. Internal details go to the log, so keep the log file outside the web root.
 
 ## Supported platforms

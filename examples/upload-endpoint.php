@@ -37,7 +37,7 @@ $turbopush
     ->setMaxChunkSize(8 * 1024 * 1024)                            // At least the client's chunkSize
     ->setAllowedExtensions(['jpg', 'jpeg', 'png', 'pdf', 'zip', 'mp4'])
     ->setAllowedMimeTypes(['image/jpeg', 'image/png', 'application/pdf', 'application/zip', 'video/mp4'])
-    ->setAllowedOrigins(['https://app.example.com'])              // Or leave the default '*'
+    ->setAllowedOrigins(['https://app.example.com'])              // Only if the page is on another origin (default: same-origin only)
     ->setUploadTtl(24 * 60 * 60)                                  // Drop abandoned chunks after a day
     ->enableLogging($storage . '/logs/turbopush.log')
     ->setFileValidator(function ($path, array $info) {

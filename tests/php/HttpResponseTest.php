@@ -23,7 +23,7 @@ class HttpResponseTest extends EndpointTestCase
 
         $this->assertSame(204, $response['status']);
         $this->assertNull($response['body']);
-        $this->assertSame('POST, OPTIONS', $response['headers']['Access-Control-Allow-Methods']);
+        $this->assertArrayNotHasKey('Access-Control-Allow-Origin', $response['headers']);
         $this->assertArrayNotHasKey('Content-Type', $response['headers']);
     }
 
