@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/tomgould/TurboPush/actions/workflows/ci.yml/badge.svg)](https://github.com/tomgould/TurboPush/actions/workflows/ci.yml)
 
-TurboPush uploads large files from the browser in chunks, and comes with a PHP endpoint that checks and reassembles them safely.
+TurboPush uploads large files from the browser in chunks, and comes with a PHP endpoint that checks and reassembles them safely. The client also speaks [tus](https://tus.io), the open protocol for resumable uploads, so it works with any tus server too.
 
 ## Why use it
 
@@ -10,9 +10,17 @@ A single multi-gigabyte POST is fragile: one dropped connection and the user sta
 
 The PHP endpoint is the part that faces the internet, so it is strict: it validates every ID, index and size against limits you set, sanitises file names, blocks executable extensions by default, supports extension and MIME allowlists, keeps chunks outside the web root, locks each upload so parallel or repeated requests cannot corrupt a file, and never reveals server paths in its errors.
 
-- Client: TypeScript, no dependencies, ESM and CommonJS builds with type declarations.
+- Client: TypeScript, no dependencies, ESM and CommonJS builds with type declarations. Speaks TurboPush's own protocol and tus 1.0.0.
 - Server: a single PHP endpoint class with no dependencies, for PHP 7.4 to 8.5.
-- The protocol is small and documented below, so you can pair either half with your own code.
+- The protocol is small and specified in [PROTOCOL.md](PROTOCOL.md), with a conformance suite, so you can pair either half with your own code.
+
+## TurboPush or tus?
+
+[tus](https://tus.io) is an open protocol for resumable uploads with mature servers: [tusd](https://github.com/tus/tusd) (Go, the reference server), [tus-node-server](https://github.com/tus/tus-node-server), [tus-php](https://github.com/ankitpokhrel/tus-php), Python servers such as aiohttp-tus, django-tus and drf-tus, and [tusdotnet](https://github.com/tusdotnet/tusdotnet).
+
+- Choose **TurboPush's PHP endpoint** when you want zero dependencies: one PHP class that runs on shared hosting with PHP 7.4 or later, with strict validation and safe file handling built in.
+- Choose **a tus server** when you want the open standard and its ecosystem: other clients (tus-js-client, Uppy, mobile SDKs), servers in many languages, cloud storage backends and hooks.
+- **The TurboPush client works with both.** Set `protocol: 'tus'` to use a tus server; see [Using a tus server](#using-a-tus-server).
 
 ## Install
 
@@ -72,6 +80,8 @@ use TurboPush\TurboPushEndpoint;
 | `headers` | object | `{}` | Extra headers for every request, such as a CSRF token |
 | `withCredentials` | boolean | `false` | Send cookies with cross-origin requests. The page's origin must be listed in the endpoint's `setAllowedOrigins()` |
 | `resumable` | boolean | `false` | Remember uploads in `localStorage` and continue them after a page reload |
+| `protocol` | `'turbopush'` \| `'tus'` | `'turbopush'` | Upload protocol. With `'tus'`, `endpoint` is the tus server's creation URL |
+| `tus` | object | `{}` | tus options, see [Using a tus server](#using-a-tus-server) |
 
 ### Methods
 
@@ -129,6 +139,47 @@ Network errors, timeouts, invalid responses and HTTP 408, 429 and 5xx are retrie
 
 With `resumable: true`, each file's upload ID is stored in `localStorage` under a key made from the endpoint, file name, size and last-modified time. When the same file is added again (after a reload, or in another tab), TurboPush asks the server which chunks it already has and sends only the rest. If the server has nothing usable, for example because the chunk size changed, it starts over. The stored ID is removed when the upload completes or is cancelled. IDs are random and never leave the browser except in requests to your endpoint, so one user cannot resume into another user's upload.
 
+## Using a tus server
+
+Point the client at the server's creation URL and set `protocol: 'tus'`:
+
+```typescript
+import { TurboPush } from 'turbopush';
+
+const uploader = new TurboPush({
+    endpoint: 'https://uploads.example.com/files/',
+    protocol: 'tus',
+    chunkSize: 5 * 1024 * 1024,
+    tus: { metadata: { album: 'holiday' } }
+});
+
+uploader
+    .addFiles(input.files)
+    .onFileComplete((fileName, fileId, result) => console.log(`${fileName} is at ${result.uploadUrl}`))
+    .push();
+```
+
+To try it locally, run tusd with `docker run -p 1080:8080 tusproject/tusd -base-path /files/` and use `http://localhost:1080/files/` as the endpoint.
+
+| `tus` option | Default | Description |
+|--------------|---------|-------------|
+| `metadata` | none | Extra `Upload-Metadata` entries, or `(file) => entries`. `filename` and `filetype` are always sent unless you set them. Keys must be ASCII without spaces or commas |
+| `parallel` | `true` | Send a file's chunks in parallel when the server supports concatenation |
+| `checksum` | `true` | Send `Upload-Checksum` when the server supports the checksum extension with sha1, sha256, sha384 or sha512 and Web Crypto is available |
+
+How it works:
+
+- The client asks the server what it supports with an `OPTIONS` request, once per instance, then creates each upload with `POST` and sends chunks with `PATCH`. After a failed or aborted request, a pause or a page reload, it asks for the offset with `HEAD` and carries on from there, even in the middle of a chunk.
+- **Parallel chunks need the concatenation extension.** The file is then split into up to `maxConcurrentUploads` partial uploads that are sent side by side and joined at the end. Without concatenation a file's chunks go one after another, as the protocol requires; several files still upload at once.
+- `cancel()` deletes unfinished uploads when the server supports the termination extension. Files larger than the server's `Tus-Max-Size` fail without being sent.
+- Retries cover network errors, timeouts and HTTP 408, 409 (after checking the offset), 423, 429, 460 and 5xx. An upload the server no longer has (403, 404 or 410) is created again. A failed request that still got data through starts the retry count afresh.
+- `result.uploadUrl` is the URL of the finished upload. `fileName` and `fileSize` are the client's values.
+- With `resumable: true`, the upload URLs are kept in `localStorage`, and after a reload the client continues from the server's offsets. Saved URLs on a different origin from the endpoint are ignored, so your `headers` never go elsewhere.
+- If the server is on another origin, its CORS settings must allow the tus request headers and expose `Location`, `Upload-Offset` and `Upload-Length`. tusd does this by default.
+- Not used: creation-with-upload, creation-defer-length and the expiration extension. If the answer to a final (concatenation) request is lost and the request is retried, the server may keep an extra copy of the finished upload.
+
+The interop tests run the client against tusd 2.10 (with and without concatenation) and tus-php 2.4. tus-php announces concatenation, but its final request does not follow the spec, so use `tus: { parallel: false }` with it.
+
 ## Server
 
 ### Configuration
@@ -165,7 +216,7 @@ return new JsonResponse($result['body'], $result['status'], $result['headers']);
 
 ### Protocol
 
-All requests are `POST` to the endpoint. Responses are JSON: `{"success": bool, "message": string, "data": object}`.
+[PROTOCOL.md](PROTOCOL.md) specifies the protocol in full, and the conformance suite checks a server against it (see Development). In short: all requests are `POST` to the endpoint. Responses are JSON: `{"success": bool, "message": string, "data": object}`.
 
 | Request | Body | Success `data` |
 |---------|------|----------------|
@@ -174,7 +225,7 @@ All requests are `POST` to the endpoint. Responses are JSON: `{"success": bool, 
 | Status | JSON: `{"action": "status", "fileId"}` | `complete`, `fileName`, `fileSize`, `totalChunks`, `receivedBytes`, `uploadedChunks` |
 | Abort | JSON: `{"action": "abort", "fileId"}` | none |
 
-`fileId` must match `[A-Za-z0-9_-]{1,200}`. JSON actions must be sent with `Content-Type: application/json`. Finalize is idempotent: repeating it after success returns the same result.
+`fileId` must match `[A-Za-z0-9_-]{1,200}`. JSON actions must be sent with `Content-Type: application/json` (parameters such as `charset` are fine). Finalize is idempotent: repeating it after success returns the same result.
 
 | Status | Meaning |
 |--------|---------|
@@ -198,12 +249,12 @@ All requests are `POST` to the endpoint. Responses are JSON: `{"success": bool, 
 - **Limits.** Uploads above `setMaxFileSize()` are refused on the first chunk. A client cannot store more bytes than it declared, more chunks than `setMaxChunks()`, or chunks above `setMaxChunkSize()`. Set PHP's `upload_max_filesize` and `post_max_size` just above the client's `chunkSize`. Assembling a very large file takes time, so check `max_execution_time`.
 - **Temp directory.** Chunks go to a folder under `sys_get_temp_dir()` named after a hash of the upload directory, created with mode 0700, so they are never in the web root. Because that location is shared, the endpoint refuses to use the folder if it is a symlink or other users can access it. If you set your own, keep it outside the web root and on a local disk: per-upload locking uses `flock()`, which is unreliable on NFS. On systems where `/tmp` is a RAM-backed tmpfs, set a temp directory on disk so large uploads do not fill memory. Abandoned uploads are deleted after `setUploadTtl()`.
 - **File names.** Names are reduced to letters, digits, dots, dashes and underscores. Leading and trailing dots are removed (no `.htaccess` or `.user.ini`), inner executable extensions are neutralised (`shell.php.jpg` becomes `shell_php.jpg`), and an existing file is never overwritten: the new file gets a `_<timestamp>` suffix. The stored name is returned to the client.
-- **CORS.** The endpoint is same-origin only by default: it sends no CORS headers and answers browser requests from other origins, preflights included, with 403. Requests without an `Origin` header (curl, server-to-server) are allowed. If the upload page is on another origin, list it with `setAllowedOrigins(['https://app.example.com', ...])`: those origins get `Access-Control-Allow-Origin` set to their own origin, with credentials, and responses carry `Vary: Origin`. Entries must be exact `scheme://host[:port]` origins; anything else throws. `['*']` allows any origin without credentials and has to be set explicitly. Same-origin is judged by comparing the `Origin` header with the `Host` header, so if a proxy in front of PHP rewrites `Host`, add your site's own origin to the list.
+- **CORS.** The endpoint is same-origin only by default: it sends no CORS headers and answers browser requests from other origins, preflights included, with 403. Requests without an `Origin` header (curl, server-to-server) are allowed. If the upload page is on another origin, list it with `setAllowedOrigins(['https://app.example.com', ...])`: those origins get `Access-Control-Allow-Origin` set to their own origin, with credentials, and responses carry `Vary: Origin`. Their preflights also allow the request headers the page asks for, so a CSRF token header sent through `headers` works. Entries must be exact `scheme://host[:port]` origins; anything else throws. `['*']` allows any origin without credentials and has to be set explicitly. Same-origin is judged by comparing the `Origin` header with the `Host` header, so if a proxy in front of PHP rewrites `Host`, add your site's own origin to the list.
 - **Errors and logs.** Error responses never include server paths. Internal details go to the log, so keep the log file outside the web root.
 
 ## Supported platforms
 
-- **Browsers:** current Chrome, Edge, Firefox and Safari. The client targets ES2020 and needs `fetch`, `AbortController`, `FormData` and `Blob.slice`, which means Chrome/Edge 80+, Firefox 74+ and Safari 13.1+. `resumable` also needs `localStorage`.
+- **Browsers:** current Chrome, Edge, Firefox and Safari. The client targets ES2020 and needs `fetch`, `AbortController`, `FormData` and `Blob.slice`, which means Chrome/Edge 80+, Firefox 74+ and Safari 13.1+. `resumable` also needs `localStorage`. tus checksums use Web Crypto, which browsers only offer on HTTPS pages (and localhost); without it chunks are sent without a checksum.
 - **Node.js:** 18 or later (tested on 18, 20, 22 and 24).
 - **PHP:** 7.4 to 8.5 (all tested in CI). `ext-fileinfo` is needed only for `setAllowedMimeTypes()`. Tested on Linux.
 
@@ -227,9 +278,13 @@ npm run build          # dist/esm and dist/cjs, with .d.ts files
 
 composer install
 composer test          # PHPUnit
+
+npm run conformance:php                                    # conformance suite against the PHP endpoint
+npm run conformance -- --url http://localhost:8000/upload.php  # ... or against any server
+npm run interop        # the client against tusd and tus-php in Docker
 ```
 
-The PHPUnit suite includes concurrency tests that start real parallel PHP processes. More detail in [tests/README.md](tests/README.md).
+The PHPUnit suite includes concurrency tests that start real parallel PHP processes. More detail in [tests/README.md](tests/README.md) and [conformance/README.md](conformance/README.md).
 
 ## Upgrading from 1.x
 

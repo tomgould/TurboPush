@@ -4,6 +4,63 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - Unreleased
+
+The client now speaks tus 1.0.0 as well as TurboPush's own protocol, so it
+works with tusd, tus-node-server, tus-php and the other tus servers. The
+native protocol is specified in PROTOCOL.md and checked by a conformance
+suite. Nothing changes for existing setups: the default protocol and the
+public API are the same.
+
+### Added
+
+- Client: `protocol: 'tus'` selects the tus transport. It discovers the
+  server's extensions (OPTIONS), creates uploads (POST with
+  `Upload-Length` and `Upload-Metadata`, including `filename` and
+  `filetype`), sends chunks (PATCH), finds the offset with HEAD after a
+  failure, pause or reload, deletes unfinished uploads on `cancel()` when
+  the server supports termination, sends `Upload-Checksum` when the server
+  offers sha1/sha256/sha384/sha512 and Web Crypto is available, and
+  respects `Tus-Max-Size`.
+- Client: with the concatenation extension, a file's chunks are uploaded in
+  parallel as up to `maxConcurrentUploads` partial uploads joined by a
+  final request. Without it, a file's chunks are sent in order (several
+  files still upload at once).
+- Client: retries with backoff, pause/resume, cancel, progress and
+  `resumable` work with tus. Resumable mode keeps the upload URLs in
+  `localStorage` and continues from the server's offsets after a reload.
+- Client: `tus` options `metadata`, `parallel` and `checksum`;
+  `UploadResult.uploadUrl`; exported types `TurboPushProtocol` and
+  `TusOptions`.
+- PROTOCOL.md: a full specification of the native endpoint protocol.
+- Conformance suite (`npm run conformance -- --url ...`) that checks a
+  server against PROTOCOL.md over HTTP, including path traversal, dangerous
+  extensions, limits, parallel and repeated finalize, abort cleanup and
+  cross-origin rejection. `npm run conformance:php` runs it against the PHP
+  endpoint on PHP's built-in server, and CI does so on every PHP version.
+- Interop tests against tusd (with and without concatenation) and tus-php
+  in Docker (`npm run interop`), also run in CI.
+- README: "TurboPush or tus?" and "Using a tus server".
+
+### Changed
+
+- PHP: CORS preflights from an allowed origin (listed or `*`) also allow
+  the request headers the browser asks for in
+  `Access-Control-Request-Headers`, and carry
+  `Vary: Access-Control-Request-Headers`. A cross-origin page can now send
+  its own headers, such as a CSRF token, through the client's `headers`
+  option. Other origins still get no CORS headers.
+
+### Fixed
+
+- PHP: the `action` field of JSON requests is compared strictly. A
+  non-string value such as `true` (or `0` on PHP 7) used to match
+  `finalize`, because PHP's `switch` compares loosely, and with a full
+  payload it finalized the upload.
+- PHP: JSON actions need the media type to be exactly `application/json`
+  (parameters such as `charset` are allowed). The check matched a prefix,
+  so `application/jsonx` was accepted.
+
 ## [2.0.0] - 2026-10-18
 
 A major release. The PHP endpoint was hardened throughout and the client's
@@ -170,5 +227,6 @@ requirements, defaults and behaviours changed; they are listed under
 - Initial release: TypeScript client with parallel chunk uploads, retries,
   progress, pause/resume and cancel; PHP endpoint that stores and merges chunks.
 
+[2.1.0]: https://github.com/tomgould/TurboPush/compare/v2.0.0...HEAD
 [2.0.0]: https://github.com/tomgould/TurboPush/compare/f5d56d0...v2.0.0
 [1.0.0]: https://github.com/tomgould/TurboPush/commit/f5d56d0
