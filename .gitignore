@@ -43,3 +43,9 @@ coverage/
 .cache/
 
 
+
+# Composer / PHPUnit
+vendor/
+composer.lock
+.phpunit.result.cache
+.phpunit.cache/

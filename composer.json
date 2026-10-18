@@ -1,0 +1,49 @@
+{
+    "name": "tomgould/turbopush",
+    "description": "PHP endpoint for TurboPush chunked uploads: validates, stores and safely reassembles file chunks sent by the TurboPush browser client.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "upload",
+        "file-upload",
+        "chunked-upload",
+        "resumable-upload",
+        "large-files"
+    ],
+    "homepage": "https://github.com/tomgould/TurboPush",
+    "support": {
+        "issues": "https://github.com/tomgould/TurboPush/issues",
+        "source": "https://github.com/tomgould/TurboPush"
+    },
+    "authors": [
+        {
+            "name": "Tom Gould",
+            "homepage": "https://github.com/tomgould"
+        }
+    ],
+    "require": {
+        "php": ">=7.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.6 || ^10.5 || ^11.5"
+    },
+    "suggest": {
+        "ext-fileinfo": "Needed for setAllowedMimeTypes()"
+    },
+    "autoload": {
+        "psr-4": {
+            "TurboPush\\": "php/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "TurboPush\\Tests\\": "tests/php/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
