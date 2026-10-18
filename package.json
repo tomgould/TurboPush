@@ -1,24 +1,65 @@
 {
   "name": "turbopush",
-  "version": "1.0.0",
-  "description": "High-Performance Chunked File Upload Library",
-  "main": "dist/TurboPush.js",
-  "types": "dist/TurboPush.d.ts",
-  "scripts": {
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage",
-    "build": "tsc",
-    "clean": "rm -rf dist"
-  },
+  "version": "1.1.0",
+  "description": "Chunked, resumable file uploads for the browser: parallel chunks, retries with backoff, pause/resume/cancel and progress events, with a hardened PHP endpoint.",
   "keywords": [
     "upload",
     "file-upload",
     "chunked-upload",
-    "typescript"
+    "resumable-upload",
+    "large-files",
+    "progress",
+    "retry",
+    "typescript",
+    "php"
   ],
-  "author": "TurboPush Team",
+  "homepage": "https://github.com/tomgould/TurboPush#readme",
+  "bugs": {
+    "url": "https://github.com/tomgould/TurboPush/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tomgould/TurboPush.git"
+  },
   "license": "MIT",
+  "author": "Tom Gould (https://github.com/tomgould)",
+  "sideEffects": false,
+  "type": "commonjs",
+  "main": "./dist/cjs/TurboPush.js",
+  "module": "./dist/esm/TurboPush.js",
+  "types": "./dist/cjs/TurboPush.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/TurboPush.d.ts",
+        "default": "./dist/esm/TurboPush.js"
+      },
+      "require": {
+        "types": "./dist/cjs/TurboPush.d.ts",
+        "default": "./dist/cjs/TurboPush.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "TurboPush.ts",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "npm run clean && tsc -p tsconfig.build.json && tsc -p tsconfig.build.cjs.json && node scripts/write-module-types.js",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:php": "vendor/bin/phpunit",
+    "demo": "npm run build && php -S localhost:8000",
+    "prepare": "npm run build"
+  },
   "devDependencies": {
     "@types/jest": "^29.0.0",
     "jest": "^29.0.0",
@@ -27,4 +68,3 @@
     "typescript": "^5.0.0"
   }
 }
-

@@ -4,14 +4,11 @@
     "module": "ES2020",
     "moduleResolution": "node",
     "lib": ["ES2020", "DOM"],
-    "outDir": "./dist",
-    "rootDir": "./",
     "strict": true,
+    "noEmit": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "declaration": true,
-    "sourceMap": true,
     "allowSyntheticDefaultImports": true
   },
   "include": [
@@ -23,4 +20,3 @@
     "dist"
   ]
 }
-
