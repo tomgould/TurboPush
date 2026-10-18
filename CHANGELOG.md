@@ -4,11 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [1.1.0] - Unreleased
+## [2.0.0] - 2026-10-18
 
-The public API of both the client and the PHP endpoint is backward compatible.
-Some defaults and behaviours changed to fix bugs and close security holes; they
-are listed under "Changed".
+A major release. The PHP endpoint was hardened throughout and the client's
+upload engine was reworked. Existing method calls keep working, but some
+requirements, defaults and behaviours changed; they are listed under
+"Breaking changes", and "Upgrading from 1.x" says what to check.
+
+### Breaking changes
+
+- PHP: requires PHP 7.4 or later (the README previously said 7.0).
+- PHP: the class is now `TurboPush\TurboPushEndpoint`. `TurboPushEndpoint.php`
+  is kept as a shim that loads it and keeps the global `TurboPushEndpoint`
+  name working.
+- PHP: CORS is same-origin only by default. 1.x sent
+  `Access-Control-Allow-Origin: *` to everyone; 2.0 sends no CORS headers and
+  rejects browser requests (including preflights) from other origins with
+  403. Origins listed with `setAllowedOrigins()` are allowed, with
+  credentials, and get `Vary: Origin`; `['*']` must now be set explicitly.
+  `setAllowedOrigins([])` means same-origin only (it used to turn CORS
+  headers and the origin check off), and invalid entries such as
+  `app.example.com` (no scheme), a path, a wildcard or `null` throw an
+  `InvalidArgumentException`.
+- PHP: errors use specific status codes: 403 origin not allowed, 404 unknown
+  upload, 405 wrong method, 409 conflicting or incomplete upload, 413 limit
+  exceeded, 415 type not allowed, 500 internal error. Everything used to be
+  400. Preflight requests get 204 (403 from origins that are not allowed).
+- PHP: JSON actions (finalize, status, abort) sent without
+  `Content-Type: application/json` get a 415. The TurboPush client has always
+  sent this header.
+- PHP: executable and script-capable extensions (`php`, `phtml`, `phar`,
+  `html`, `svg` and others) are blocked by default, even without an
+  allowlist. See `setBlockedExtensions()`.
+- PHP: the second constructor argument (temp directory) defaults to a folder
+  under `sys_get_temp_dir()` instead of `./uploads/temp/`.
+- Client: `cancel()` settles a pending `push()` with `cancelled: true` (it
+  used to stay pending forever), sends an `abort` request to the server, and
+  resets the statistics.
+- Client: `maxConcurrentUploads` limits chunk requests across all files, as
+  documented, instead of per file.
+
+### Upgrading from 1.x
+
+1. Make sure the server runs PHP 7.4 or later.
+2. Code that requires `TurboPushEndpoint.php` and uses the global
+   `TurboPushEndpoint` class keeps working. With Composer, use
+   `TurboPush\TurboPushEndpoint`.
+3. If the upload page is served from a different origin than the endpoint,
+   list it: `setAllowedOrigins(['https://app.example.com'])`. Use `['*']`
+   only if you really want any site to call the endpoint, and never with
+   cookie authentication. If a proxy in front of PHP rewrites the `Host`
+   header, same-origin requests look cross-origin, so add your site's own
+   origin as well.
+4. If your code checks for status 400, handle the new codes (or treat any
+   4xx as a rejected upload).
+5. A custom client must send JSON actions with
+   `Content-Type: application/json`.
+6. If you upload HTML, SVG or other blocked types on purpose, pass your own
+   list to `setBlockedExtensions()`.
+7. Pass a temp directory to the constructor if chunks must live somewhere
+   specific. The old `./uploads/temp/` folder can be deleted.
+8. Code that waited on `push()` after `cancel()` now gets a result: check
+   `stats.cancelled`.
 
 ### Security
 
@@ -43,6 +100,10 @@ are listed under "Changed".
 - JSON actions now require `Content-Type: application/json`, so cross-site
   finalize, status and abort requests cannot be sent without a CORS
   preflight.
+- Any website could call the endpoint from a visitor's browser, because the
+  default CORS policy was `*` and cross-origin chunk uploads (ordinary
+  multipart posts) were accepted. The endpoint is now same-origin only unless
+  you list other origins (see "Breaking changes").
 - Error responses could contain server paths (for example "Failed to create
   dir: /var/www/..."), and PHP errors such as a failed `fopen()` escaped as
   fatal errors. Internal errors are now logged and reported as a generic 500.
@@ -73,25 +134,9 @@ are listed under "Changed".
 
 ### Changed
 
-- PHP: the class is now `TurboPush\TurboPushEndpoint`. `TurboPushEndpoint.php`
-  still loads it and keeps the global `TurboPushEndpoint` name working.
-- PHP: the second constructor argument (temp directory) now defaults to a
-  folder under `sys_get_temp_dir()` instead of `./uploads/temp/`.
 - PHP: directories are created on the first request instead of in the
   constructor.
-- PHP: errors use specific status codes: 404 unknown upload, 405 wrong method,
-  409 conflicting or incomplete upload, 413 limit exceeded, 415 type not
-  allowed, 500 internal error. Everything used to be 400. Preflight requests
-  get 204.
-- PHP: requires PHP 7.4 or later (the README previously said 7.0).
 - PHP: `setAllowedExtensions()` also accepts extensions with a leading dot.
-- PHP: JSON actions sent without `Content-Type: application/json` get a 415.
-  The TurboPush client has always sent this header.
-- Client: `maxConcurrentUploads` limits chunk requests across all files, as
-  documented, instead of per file.
-- Client: `cancel()` settles a pending `push()` with `cancelled: true` (it used
-  to stay pending forever), sends an `abort` request to the server, and resets
-  the statistics.
 - Client: `push()` skips files that are already complete and, for failed
   files, sends only the chunks the server does not have (including chunks a
   finalize reported missing).
@@ -125,5 +170,5 @@ are listed under "Changed".
 - Initial release: TypeScript client with parallel chunk uploads, retries,
   progress, pause/resume and cancel; PHP endpoint that stores and merges chunks.
 
-[1.1.0]: https://github.com/tomgould/TurboPush/compare/f5d56d0...HEAD
+[2.0.0]: https://github.com/tomgould/TurboPush/compare/f5d56d0...v2.0.0
 [1.0.0]: https://github.com/tomgould/TurboPush/commit/f5d56d0

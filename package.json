@@ -1,6 +1,6 @@
 {
   "name": "turbopush",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "Chunked, resumable file uploads for the browser: parallel chunks, retries with backoff, pause/resume/cancel and progress events, with a hardened PHP endpoint.",
   "keywords": [
     "upload",

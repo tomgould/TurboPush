@@ -14,7 +14,7 @@ namespace TurboPush;
  * an internal error: it is logged and the client only sees a generic 500.
  *
  * @package TurboPush
- * @since   1.1.0
+ * @since   2.0.0
  *
  * @example
  * ```php

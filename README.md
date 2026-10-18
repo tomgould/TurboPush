@@ -231,16 +231,19 @@ composer test          # PHPUnit
 
 The PHPUnit suite includes concurrency tests that start real parallel PHP processes. More detail in [tests/README.md](tests/README.md).
 
-## Upgrading from 1.0
+## Upgrading from 1.x
 
-The public API is unchanged, but a few behaviours changed. See [CHANGELOG.md](CHANGELOG.md) for the full list. The main ones:
+2.0.0 is a major release. Existing method calls keep working, but these changes can break a 1.x setup. [CHANGELOG.md](CHANGELOG.md) has the full list.
 
-- The PHP class is now `TurboPush\TurboPushEndpoint`. The old global name still works through `TurboPushEndpoint.php`.
-- The default temp directory moved from `./uploads/temp/` to a folder under `sys_get_temp_dir()`.
-- The endpoint returns specific status codes (404, 409, 413, 415, 500 and so on) instead of 400 for everything, and blocks executable and script-capable extensions (such as `php`, `html` and `svg`) by default.
-- JSON actions must be sent with `Content-Type: application/json`. The bundled client always did this.
-- `cancel()` now settles the pending `push()` promise instead of leaving it pending forever.
-- `maxConcurrentUploads` now limits requests across all files, not per file.
+- **PHP 7.4 or later** is required.
+- **Namespaced class.** The PHP class is now `TurboPush\TurboPushEndpoint`. `TurboPushEndpoint.php` remains as a shim, so `require_once 'TurboPushEndpoint.php'` and the global `TurboPushEndpoint` name still work. With Composer, `use TurboPush\TurboPushEndpoint;`.
+- **CORS is same-origin only by default.** 1.x sent `Access-Control-Allow-Origin: *`. If your upload page is on a different origin from the endpoint, add `->setAllowedOrigins(['https://app.example.com'])`, or `['*']` to restore the old behaviour (not with cookie authentication). Behind a proxy that rewrites `Host`, add your own origin too. `setAllowedOrigins([])` now means same-origin only rather than "no CORS checks".
+- **Specific status codes.** Errors return 403, 404, 405, 409, 413, 415 or 500 instead of 400 for everything. Update any code that checks for 400.
+- **JSON actions need `Content-Type: application/json`.** Others get a 415. The bundled client always sent it, so this only affects custom clients.
+- **`cancel()` settles `push()`.** A pending `push()` now resolves with `cancelled: true` instead of staying pending forever.
+- **Blocked extensions.** Executable and script-capable extensions (such as `php`, `html` and `svg`) are rejected by default. Pass your own list to `setBlockedExtensions()` if you need them.
+- **Temp directory.** The default moved from `./uploads/temp/` to a folder under `sys_get_temp_dir()`. Pass the second constructor argument to choose your own.
+- **Concurrency.** `maxConcurrentUploads` now limits requests across all files, not per file.
 
 ## License
 

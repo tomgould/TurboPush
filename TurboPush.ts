@@ -7,7 +7,7 @@
  * efficiently and reliably.
  *
  * @module TurboPush
- * @version 1.1.0
+ * @version 2.0.0
  * @license MIT
  * @author TomGould
  *
@@ -269,7 +269,7 @@ interface TurboPushErrorOptions {
  * deciding what to do next.
  *
  * @class TurboPushError
- * @since 1.1.0
+ * @since 2.0.0
  *
  * @example
  * ```typescript

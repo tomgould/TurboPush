@@ -11,3 +11,4 @@
 /tsconfig.json export-ignore
 /tsconfig.build.json export-ignore
 /tsconfig.build.cjs.json export-ignore
+/TurboPush.ts export-ignore

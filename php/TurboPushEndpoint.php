@@ -22,7 +22,7 @@ namespace TurboPush;
  * - Optional logging
  *
  * @package    TurboPush
- * @version    1.1.0
+ * @version    2.0.0
  * @license    MIT
  * @author     TomGould
  *
@@ -481,7 +481,7 @@ class TurboPushEndpoint
      * @param string $body   Raw request body (used for JSON requests)
      * @return array Response as ['status' => int, 'headers' => array, 'body' => array|null]
      *
-     * @since 1.1.0
+     * @since 2.0.0
      */
     public function processRequest(array $server, array $post, array $files, $body = '') {
         $response = $this->dispatch($server, $post, $files, $body);
@@ -947,7 +947,7 @@ class TurboPushEndpoint
      * @param int|null $maxAge Override the TTL in seconds
      * @return int Number of uploads removed
      *
-     * @since 1.1.0
+     * @since 2.0.0
      *
      * @example
      * ```php
