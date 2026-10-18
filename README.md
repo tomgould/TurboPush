@@ -20,7 +20,7 @@ The PHP endpoint is the part that faces the internet, so it is strict: it valida
 
 - Choose **TurboPush's PHP endpoint** when you want zero dependencies: one PHP class that runs on shared hosting with PHP 7.4 or later, with strict validation and safe file handling built in.
 - Choose **a tus server** when you want the open standard and its ecosystem: other clients (tus-js-client, Uppy, mobile SDKs), servers in many languages, cloud storage backends and hooks.
-- **The TurboPush client works with both.** Set `protocol: 'tus'` to use a tus server; see [Using a tus server](#using-a-tus-server).
+- The TurboPush client works with both. Set `protocol: 'tus'` to use a tus server; see [Using a tus server](#using-a-tus-server).
 
 ## Install
 
@@ -170,7 +170,7 @@ To try it locally, run tusd with `docker run -p 1080:8080 tusproject/tusd -base-
 How it works:
 
 - The client asks the server what it supports with an `OPTIONS` request, once per instance, then creates each upload with `POST` and sends chunks with `PATCH`. After a failed or aborted request, a pause or a page reload, it asks for the offset with `HEAD` and carries on from there, even in the middle of a chunk.
-- **Parallel chunks need the concatenation extension.** The file is then split into up to `maxConcurrentUploads` partial uploads that are sent side by side and joined at the end. Without concatenation a file's chunks go one after another, as the protocol requires; several files still upload at once.
+- Parallel chunks need the concatenation extension. The file is then split into up to `maxConcurrentUploads` partial uploads that are sent side by side and joined at the end. Without concatenation a file's chunks go one after another, as the protocol requires; several files still upload at once.
 - `cancel()` deletes unfinished uploads when the server supports the termination extension. Files larger than the server's `Tus-Max-Size` fail without being sent.
 - Retries cover network errors, timeouts and HTTP 408, 409 (after checking the offset), 423, 429, 460 and 5xx. An upload the server no longer has (403, 404 or 410) is created again. A failed request that still got data through starts the retry count afresh.
 - `result.uploadUrl` is the URL of the finished upload. `fileName` and `fileSize` are the client's values.
