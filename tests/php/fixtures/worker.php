@@ -27,7 +27,12 @@ if ($job['type'] === 'chunk') {
     ]];
     $response = $endpoint->processRequest(['REQUEST_METHOD' => 'POST'], $job['fields'], $files, '');
 } else {
-    $response = $endpoint->processRequest(['REQUEST_METHOD' => 'POST'], [], [], json_encode($job['body']));
+    $response = $endpoint->processRequest(
+        ['REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'application/json'],
+        [],
+        [],
+        json_encode($job['body'])
+    );
 }
 
 echo json_encode(['status' => $response['status'], 'body' => $response['body']]);

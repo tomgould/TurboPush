@@ -66,4 +66,12 @@ class ExtensionPolicyTest extends EndpointTestCase
         $this->assertSame(415, $response['status']);
         $this->assertSame([], self::listFiles($this->uploadDir));
     }
+
+    public function testBlocksTypesBrowsersRunScriptsInByDefault(): void {
+        $endpoint = $this->endpoint();
+        foreach (['page.html', 'page.HTM', 'page.xhtml', 'image.svg', 'image.svgz', 'archive.mht', 'app.hta', 'lib.inc', 'x.php6'] as $i => $name) {
+            $response = $this->sendChunk($endpoint, $this->chunkFields('xss' . $i, $name, 4, 1, 0), 'data');
+            $this->assertSame(415, $response['status'], $name);
+        }
+    }
 }

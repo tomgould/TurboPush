@@ -73,4 +73,24 @@ class FileNameSanitizationTest extends EndpointTestCase
             $this->assertSame('new ' . $i, file_get_contents($this->uploadDir . $name));
         }
     }
+
+    public function testTruncationCannotRestoreADoubleExtension(): void {
+        // Long enough that truncation used to cut the neutralised part away
+        $name = str_repeat('a', 192) . '.php.' . str_repeat('x', 20) . '.jpg';
+        $endpoint = $this->endpoint()->setAllowedExtensions(['jpg']);
+
+        $response = $this->upload($endpoint, 'trunc', $name, 'x');
+
+        $this->assertSame(200, $response['status']);
+        $stored = $response['body']['data']['fileName'];
+        $this->assertStringNotContainsString('.php', $stored);
+        $this->assertStringEndsWith('.jpg', $stored);
+    }
+
+    public function testTruncationDoesNotLeaveATrailingDot(): void {
+        $response = $this->upload($this->endpoint(), 'dot', str_repeat('a', 199) . '.' . str_repeat('b', 30), 'x');
+
+        $this->assertSame(200, $response['status']);
+        $this->assertStringEndsNotWith('.', $response['body']['data']['fileName']);
+    }
 }

@@ -54,7 +54,7 @@ class TurboPushEndpoint
      * Upload IDs may only contain letters, digits, dashes and underscores,
      * so they can never point outside the temporary directory.
      */
-    const UPLOAD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,200}$/';
+    const UPLOAD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,200}$/D';
 
     /**
      * Maximum size of a JSON request body (finalize requests) in bytes
@@ -113,14 +113,16 @@ class TurboPushEndpoint
     private $allowedExtensions = [];
 
     /**
-     * Extensions that are always rejected because a web server may execute them.
+     * Extensions that are always rejected: ones a web server may execute, and
+     * ones a browser runs scripts in when served from your domain.
      * Applied even when no allowlist is set. Override with setBlockedExtensions().
      * @var array
      */
     private $blockedExtensions = [
-        'php', 'php3', 'php4', 'php5', 'php7', 'php8', 'phtml', 'pht', 'phar', 'phps',
-        'cgi', 'pl', 'asp', 'aspx', 'ashx', 'asmx', 'jsp', 'jspx', 'shtml', 'shtm',
-        'htaccess', 'htpasswd',
+        'php', 'php2', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8', 'phtml', 'phtm',
+        'pht', 'phar', 'phps', 'inc', 'cgi', 'pl', 'asp', 'aspx', 'ashx', 'asmx', 'jsp',
+        'jspx', 'shtml', 'shtm', 'htaccess', 'htpasswd',
+        'html', 'htm', 'xhtml', 'xht', 'svg', 'svgz', 'mht', 'mhtml', 'hta',
     ];
 
     /**
@@ -166,6 +168,12 @@ class TurboPushEndpoint
     private $logFile = null;
 
     /**
+     * Whether the temp directory is the shared-location default
+     * @var bool
+     */
+    private $defaultTempDir = false;
+
+    /**
      * Constructs a new TurboPushEndpoint instance
      *
      * Directories are created on first use, not here, so a misconfigured
@@ -183,6 +191,7 @@ class TurboPushEndpoint
     public function __construct($uploadDir = './uploads/', $tempDir = null) {
         // Normalize directory paths with trailing slashes
         $this->uploadDir = rtrim($uploadDir, '/\\') . '/';
+        $this->defaultTempDir = $tempDir === null;
         $this->tempDir = rtrim($tempDir !== null ? $tempDir : $this->defaultTempDir(), '/\\') . '/';
     }
 
@@ -399,7 +408,7 @@ class TurboPushEndpoint
     public function setAllowedOrigins($origins) {
         $normalized = [];
         foreach ((array) $origins as $origin) {
-            $origin = rtrim(trim((string) $origin), '/');
+            $origin = strtolower(rtrim(trim((string) $origin), '/'));
             if ($origin !== '') {
                 $normalized[] = $origin;
             }
@@ -520,11 +529,18 @@ class TurboPushEndpoint
             // JSON requests carry actions
             $json = $body !== '' ? json_decode($body, true) : null;
             if (is_array($json) && isset($json['action'])) {
+                // Requiring the JSON content type means browsers must send a CORS
+                // preflight for cross-site actions, which blocks simple CSRF
+                if (!isset($server['CONTENT_TYPE']) || stripos($server['CONTENT_TYPE'], 'application/json') !== 0) {
+                    throw new TurboPushException('Content-Type must be application/json', 415);
+                }
                 return $this->handleAction($json);
             }
 
             // PHP drops the whole body when it exceeds post_max_size
-            if ($this->isMultipart($server) && isset($server['CONTENT_LENGTH']) && (int) $server['CONTENT_LENGTH'] > 0) {
+            $postMaxSize = $this->iniBytes((string) ini_get('post_max_size'));
+            if ($this->isMultipart($server) && isset($server['CONTENT_LENGTH'])
+                && $postMaxSize > 0 && (int) $server['CONTENT_LENGTH'] > $postMaxSize) {
                 throw new TurboPushException('Chunk exceeds the server upload size limit', 413);
             }
 
@@ -598,6 +614,7 @@ class TurboPushEndpoint
         // Create temporary directory for this upload's chunks
         $fileTempDir = $this->uploadTempDir($uploadId);
         $this->ensureDirectory($this->tempDir, 0700);
+        $this->assertTempDirIsPrivate();
         $this->ensureDirectory($fileTempDir, 0700);
 
         $lock = $this->acquireLock($fileTempDir);
@@ -703,6 +720,7 @@ class TurboPushEndpoint
         $this->log("Finalizing: $fileName ($uploadId)");
 
         // Locate temporary directory containing chunks
+        $this->assertTempDirIsPrivate();
         $fileTempDir = $this->uploadTempDir($uploadId);
         if (!is_dir($fileTempDir)) {
             throw new TurboPushException('Upload not found', 404);
@@ -836,6 +854,7 @@ class TurboPushEndpoint
         }
         $uploadId = $this->validateUploadId($data['fileId']);
 
+        $this->assertTempDirIsPrivate();
         $fileTempDir = $this->uploadTempDir($uploadId);
         if (!is_dir($fileTempDir)) {
             throw new TurboPushException('Upload not found', 404);
@@ -856,7 +875,7 @@ class TurboPushEndpoint
 
             $uploaded = [];
             foreach (scandir($fileTempDir) ?: [] as $entry) {
-                if (preg_match('/^chunk_([0-9]{10})$/', $entry, $match)) {
+                if (preg_match('/^chunk_([0-9]{10})$/D', $entry, $match)) {
                     $uploaded[] = (int) $match[1];
                 }
             }
@@ -892,6 +911,7 @@ class TurboPushEndpoint
         }
         $uploadId = $this->validateUploadId($data['fileId']);
 
+        $this->assertTempDirIsPrivate();
         $fileTempDir = $this->uploadTempDir($uploadId);
         if (is_dir($fileTempDir)) {
             $this->removeUploadDir($fileTempDir, false);
@@ -927,6 +947,7 @@ class TurboPushEndpoint
         $removed = 0;
 
         if (is_dir($this->tempDir)) {
+            $this->assertTempDirIsPrivate();
             foreach (scandir($this->tempDir) ?: [] as $entry) {
                 $dir = $this->tempDir . $entry;
                 if (!preg_match(self::UPLOAD_ID_PATTERN, $entry) || is_link($dir) || !is_dir($dir)) {
@@ -945,7 +966,7 @@ class TurboPushEndpoint
         // Assembly files left behind by a crashed finalize
         foreach ((is_dir($this->uploadDir) ? scandir($this->uploadDir) : false) ?: [] as $entry) {
             $partPath = $this->uploadDir . $entry;
-            if (!preg_match('/^\.turbopush-[0-9a-f]+\.part$/', $entry) || !is_file($partPath)) {
+            if (!preg_match('/^\.turbopush-[0-9a-f]+\.part$/D', $entry) || !is_file($partPath)) {
                 continue;
             }
             clearstatcache(true, $partPath);
@@ -1007,8 +1028,8 @@ class TurboPushEndpoint
         foreach (scandir($fileTempDir) ?: [] as $entry) {
             if ($entry === self::META_FILE
                 || $entry === self::DONE_FILE
-                || preg_match('/^chunk_[0-9]{10}(\.[0-9a-f]+\.part)?$/', $entry)
-                || preg_match('/^(upload|complete)\.json\.[0-9a-f]+\.tmp$/', $entry)) {
+                || preg_match('/^chunk_[0-9]{10}(\.[0-9a-f]+\.part)?$/D', $entry)
+                || preg_match('/^(upload|complete)\.json\.[0-9a-f]+\.tmp$/D', $entry)) {
                 @unlink($fileTempDir . $entry);
             }
         }
@@ -1137,7 +1158,7 @@ class TurboPushEndpoint
             return $value;
         }
 
-        if (!is_string($value) || !preg_match('/^[0-9]{1,18}$/', $value)) {
+        if (!is_string($value) || !preg_match('/^[0-9]{1,18}$/D', $value)) {
             throw new TurboPushException("Invalid $field", 400);
         }
 
@@ -1230,9 +1251,9 @@ class TurboPushEndpoint
      *
      * Keeps only the last path segment, replaces anything other than letters,
      * digits, dot, dash and underscore, strips leading and trailing dots (no
-     * hidden files such as .htaccess or .user.ini), neutralises blocked inner
-     * extensions (shell.php.jpg becomes shell_php.jpg), avoids Windows device
-     * names and truncates long names while preserving the extension.
+     * hidden files such as .htaccess or .user.ini), truncates long names while
+     * preserving the extension, neutralises blocked inner extensions
+     * (shell.php.jpg becomes shell_php.jpg) and avoids Windows device names.
      *
      * @param string $fileName Original filename
      * @return string Sanitized filename safe for storage
@@ -1253,6 +1274,18 @@ class TurboPushEndpoint
         // No hidden files, no "..", no trailing dots (Windows drops them)
         $fileName = trim($fileName, '.');
 
+        // Truncate long filenames first, leaving room for a collision suffix,
+        // so truncation cannot undo anything below
+        if (strlen($fileName) > 200) {
+            $ext = pathinfo($fileName, PATHINFO_EXTENSION);
+            if ($ext !== '' && strlen($ext) <= 20) {
+                $fileName = substr($fileName, 0, 200 - strlen($ext) - 1) . '.' . $ext;
+            } else {
+                $fileName = substr($fileName, 0, 200);
+            }
+            $fileName = trim($fileName, '.');
+        }
+
         // Neutralise blocked extensions in the middle of the name
         $parts = explode('.', $fileName);
         if (count($parts) > 2) {
@@ -1271,16 +1304,6 @@ class TurboPushEndpoint
 
         if ($fileName === '') {
             $fileName = 'file';
-        }
-
-        // Truncate long filenames, leaving room for a collision suffix
-        if (strlen($fileName) > 200) {
-            $ext = pathinfo($fileName, PATHINFO_EXTENSION);
-            if ($ext !== '' && strlen($ext) <= 20) {
-                $fileName = substr($fileName, 0, 200 - strlen($ext) - 1) . '.' . $ext;
-            } else {
-                $fileName = substr($fileName, 0, 200);
-            }
         }
 
         return $fileName;
@@ -1506,6 +1529,34 @@ class TurboPushEndpoint
     }
 
     /**
+     * Refuses to use the default temp directory if other users can access it
+     *
+     * The default lives in the shared system temp directory under a
+     * predictable name, so another local user could create it first and
+     * plant files or symlinks. A directory TurboPush created is mode 0700 and
+     * not a symlink; anything else is rejected. Skipped on Windows and for a
+     * temp directory you configured yourself.
+     *
+     * @return void
+     * @throws \RuntimeException If the directory is not private
+     *
+     * @private
+     */
+    private function assertTempDirIsPrivate() {
+        if (!$this->defaultTempDir || DIRECTORY_SEPARATOR === '\\') {
+            return;
+        }
+        $dir = rtrim($this->tempDir, '/');
+        clearstatcache(true, $dir);
+        if (!file_exists($dir)) {
+            return;
+        }
+        if (is_link($dir) || !is_dir($dir) || (fileperms($dir) & 0077) !== 0) {
+            throw new \RuntimeException('Refusing to use temp directory ' . $dir . ': it is a symlink or other users can access it');
+        }
+    }
+
+    /**
      * Opens and exclusively locks an upload's lock file
      *
      * @param string $fileTempDir Upload directory
@@ -1515,23 +1566,41 @@ class TurboPushEndpoint
      * @private
      */
     private function acquireLock($fileTempDir) {
-        $handle = @fopen($fileTempDir . self::LOCK_FILE, 'c');
-        if ($handle === false) {
-            throw new \RuntimeException('Failed to open lock file in ' . $fileTempDir);
-        }
-        if (!flock($handle, LOCK_EX)) {
-            fclose($handle);
-            throw new \RuntimeException('Failed to lock ' . $fileTempDir);
-        }
+        $lockPath = $fileTempDir . self::LOCK_FILE;
 
-        // The upload was aborted or cleaned up while we waited for the lock
-        clearstatcache(true, $fileTempDir . self::LOCK_FILE);
-        if (!is_file($fileTempDir . self::LOCK_FILE)) {
+        for ($attempt = 0; $attempt < 5; $attempt++) {
+            $handle = @fopen($lockPath, 'c');
+            if ($handle === false) {
+                if (!is_dir($fileTempDir)) {
+                    // Removed by abort or cleanup since the caller checked
+                    throw new TurboPushException('Upload was cancelled or has expired', 409);
+                }
+                throw new \RuntimeException('Failed to open lock file in ' . $fileTempDir);
+            }
+            if (!flock($handle, LOCK_EX)) {
+                fclose($handle);
+                throw new \RuntimeException('Failed to lock ' . $fileTempDir);
+            }
+
+            // removeUploadDir() unlinks the lock file while holding it. If that
+            // happened while we waited, our handle points at the old file, and
+            // the path may already hold a new one: only the file currently at
+            // the path counts, so check it is the one we locked
+            $locked = fstat($handle);
+            clearstatcache(true, $lockPath);
+            $current = @stat($lockPath);
+            if ($current !== false && $locked !== false
+                && $current['ino'] === $locked['ino'] && $current['dev'] === $locked['dev']) {
+                return $handle;
+            }
+
             $this->releaseLock($handle);
-            throw new TurboPushException('Upload was cancelled or has expired', 409);
+            if (!is_dir($fileTempDir)) {
+                throw new TurboPushException('Upload was cancelled or has expired', 409);
+            }
         }
 
-        return $handle;
+        throw new \RuntimeException('Could not lock ' . $fileTempDir);
     }
 
     /**
@@ -1615,6 +1684,33 @@ class TurboPushEndpoint
     }
 
     /**
+     * Converts a php.ini size such as "8M" to bytes
+     *
+     * @param string $value php.ini value
+     * @return int Bytes (0 = unlimited or unknown)
+     *
+     * @private
+     */
+    private function iniBytes($value) {
+        $value = trim($value);
+        if (!preg_match('/^([0-9]+)\s*([kmg]?)$/iD', $value, $match)) {
+            return 0;
+        }
+        $bytes = (int) $match[1];
+        switch (strtolower($match[2])) {
+            case 'g':
+                $bytes *= 1024;
+                // no break
+            case 'm':
+                $bytes *= 1024;
+                // no break
+            case 'k':
+                $bytes *= 1024;
+        }
+        return $bytes;
+    }
+
+    /**
      * Checks whether the request is multipart/form-data
      *
      * @param array $server Server parameters
@@ -1671,7 +1767,7 @@ class TurboPushEndpoint
         }
 
         $origin = isset($server['HTTP_ORIGIN']) ? rtrim((string) $server['HTTP_ORIGIN'], '/') : '';
-        if ($origin !== '' && in_array($origin, $this->allowedOrigins, true)) {
+        if ($origin !== '' && in_array(strtolower($origin), $this->allowedOrigins, true)) {
             return [
                 'Access-Control-Allow-Origin' => $origin,
                 'Access-Control-Allow-Credentials' => 'true',
@@ -1698,7 +1794,7 @@ class TurboPushEndpoint
             return true;
         }
 
-        $origin = isset($server['HTTP_ORIGIN']) ? rtrim((string) $server['HTTP_ORIGIN'], '/') : '';
+        $origin = isset($server['HTTP_ORIGIN']) ? strtolower(rtrim((string) $server['HTTP_ORIGIN'], '/')) : '';
         if ($origin === '' || in_array($origin, $this->allowedOrigins, true)) {
             return true;
         }

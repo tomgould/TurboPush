@@ -96,6 +96,46 @@ class ConcurrencyTest extends EndpointTestCase
         $this->assertSame('abcdefgh', file_get_contents($this->uploadDir . 'a.txt'));
     }
 
+    public function testWaiterNoticesWhenTheLockFileIsReplaced(): void {
+        $endpoint = $this->endpoint();
+        $this->sendAllChunks($endpoint, 'swap', 'a.txt', 'abcdefgh', 4, [0]);
+        $lockPath = $this->tempDir . 'swap/.lock';
+
+        // Request A (the worker) waits on the current lock file
+        $old = fopen($lockPath, 'c');
+        flock($old, LOCK_EX);
+        touch($this->barrier);
+        [$process, $stdout, $jobFile] = $this->startWorker([
+            'type' => 'chunk',
+            'fields' => $this->chunkFields('swap', 'a.txt', 8, 2, 1),
+            'content' => base64_encode('efgh'),
+        ]);
+        usleep(300000);
+
+        // Meanwhile the lock file is unlinked (as abort does) and request B
+        // takes a lock on a new file at the same path
+        unlink($lockPath);
+        $new = fopen($lockPath, 'c');
+        flock($new, LOCK_EX);
+        flock($old, LOCK_UN);
+        fclose($old);
+
+        // A now holds the old, unlinked file and must not proceed
+        usleep(500000);
+        $this->assertTrue(proc_get_status($process)['running'], 'request must wait for the lock that is in use now');
+        $this->assertFileDoesNotExist($this->tempDir . 'swap/chunk_0000000001');
+
+        flock($new, LOCK_UN);
+        fclose($new);
+        $result = json_decode(stream_get_contents($stdout), true);
+        fclose($stdout);
+        proc_close($process);
+        unlink($jobFile);
+
+        $this->assertSame(200, $result['status'], json_encode($result));
+        $this->assertFileExists($this->tempDir . 'swap/chunk_0000000001');
+    }
+
     /**
      * Starts all jobs, releases them at once and returns their responses.
      */

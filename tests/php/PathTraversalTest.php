@@ -10,7 +10,7 @@ class PathTraversalTest extends EndpointTestCase
 {
     public function testRejectsUploadIdsThatAreNotPlainTokens(): void {
         $endpoint = $this->endpoint();
-        $badIds = ['..', '.', '../escape', 'a/b', 'a\\b', '..%2f', "abc\0def", '', ' ', 'a.b', str_repeat('a', 201)];
+        $badIds = ['..', '.', '../escape', 'a/b', 'a\\b', '..%2f', "abc\0def", '', ' ', 'a.b', str_repeat('a', 201), "evil\n", "x\r\n"];
 
         foreach ($badIds as $id) {
             $response = $this->sendChunk($endpoint, $this->chunkFields($id, 'a.txt', 4, 1, 0), 'data');
@@ -65,7 +65,7 @@ class PathTraversalTest extends EndpointTestCase
 
     public function testRejectsInvalidChunkIndexes(): void {
         $endpoint = $this->endpoint();
-        $badIndexes = ['-1', '1e3', '0x1', '1.5', ' 1', 'abc', '', '99999999999999999999', '3'];
+        $badIndexes = ['-1', '1e3', '0x1', '1.5', ' 1', "1\n", 'abc', '', '99999999999999999999', '3'];
 
         foreach ($badIndexes as $index) {
             $fields = $this->chunkFields('idx', 'a.txt', 12, 3, 0);

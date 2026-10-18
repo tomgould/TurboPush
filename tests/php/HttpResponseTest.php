@@ -45,6 +45,60 @@ class HttpResponseTest extends EndpointTestCase
         $this->assertSame(400, $endpoint->processRequest(['REQUEST_METHOD' => 'POST'], [], [], 'not json')['status']);
     }
 
+    public function testActionsRequireTheJsonContentType(): void {
+        $endpoint = $this->endpoint();
+        $this->sendAllChunks($endpoint, 'csrf', 'a.txt', 'abcd', 4);
+        $body = json_encode(['action' => 'abort', 'fileId' => 'csrf']);
+
+        // A cross-site form or fetch can send text/plain without a preflight
+        foreach (['text/plain', 'application/x-www-form-urlencoded', null] as $type) {
+            $server = ['REQUEST_METHOD' => 'POST'] + ($type ? ['CONTENT_TYPE' => $type] : []);
+            $response = $endpoint->processRequest($server, [], [], $body);
+            $this->assertSame(415, $response['status'], (string) $type);
+        }
+        $this->assertDirectoryExists($this->tempDir . 'csrf');
+
+        $response = $endpoint->processRequest(['REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'application/json; charset=utf-8'], [], [], $body);
+        $this->assertSame(200, $response['status']);
+    }
+
+    public function testEmptyMultipartBodyBelowTheLimitIsABadRequest(): void {
+        $response = $this->endpoint()->processRequest(
+            ['REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'multipart/form-data; boundary=x', 'CONTENT_LENGTH' => '120'],
+            [],
+            [],
+            ''
+        );
+        $this->assertSame(400, $response['status']);
+    }
+
+    public function testRefusesADefaultTempDirOtherUsersCanAccess(): void {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('Permission check is skipped on Windows');
+        }
+        $endpoint = new TestableEndpoint($this->uploadDir);
+        $property = new \ReflectionProperty(TurboPushEndpoint::class, 'tempDir');
+        if (PHP_VERSION_ID < 80100) {
+            $property->setAccessible(true);
+        }
+        $tempDir = rtrim($property->getValue($endpoint), '/');
+
+        // Another local user got there first and left it world-writable
+        mkdir($tempDir, 0700);
+        chmod($tempDir, 0777);
+        try {
+            $response = $this->sendChunk($endpoint, $this->chunkFields('shared', 'a.txt', 4, 1, 0), 'data');
+            $this->assertSame(500, $response['status']);
+            $this->assertDirectoryDoesNotExist($tempDir . '/shared');
+
+            chmod($tempDir, 0700);
+            $response = $this->sendChunk($endpoint, $this->chunkFields('shared', 'a.txt', 4, 1, 0), 'data');
+            $this->assertSame(200, $response['status']);
+        } finally {
+            self::removeTree($tempDir);
+        }
+    }
+
     public function testRejectsOversizedJsonBodies(): void {
         $body = json_encode(['action' => 'finalize', 'padding' => str_repeat('x', TurboPushEndpoint::MAX_JSON_BODY)]);
         $response = $this->endpoint()->processRequest(['REQUEST_METHOD' => 'POST'], [], [], $body);

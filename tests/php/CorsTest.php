@@ -9,7 +9,12 @@ class CorsTest extends EndpointTestCase
 {
     private function request(array $server, $endpoint = null): array {
         $endpoint = $endpoint ?: $this->endpoint();
-        return $endpoint->processRequest($server + ['REQUEST_METHOD' => 'POST'], [], [], json_encode(['action' => 'status', 'fileId' => 'none']));
+        return $endpoint->processRequest(
+            $server + ['REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'application/json'],
+            [],
+            [],
+            json_encode(['action' => 'status', 'fileId' => 'none'])
+        );
     }
 
     public function testAllowsAnyOriginByDefault(): void {
@@ -53,5 +58,13 @@ class CorsTest extends EndpointTestCase
 
         $this->assertArrayNotHasKey('Access-Control-Allow-Origin', $response['headers']);
         $this->assertArrayNotHasKey('Access-Control-Allow-Methods', $response['headers']);
+    }
+
+    public function testOriginsMatchCaseInsensitively(): void {
+        $endpoint = $this->endpoint()->setAllowedOrigins(['https://App.Example']);
+        $response = $this->request(['HTTP_ORIGIN' => 'https://app.example', 'HTTP_HOST' => 'upload.example'], $endpoint);
+
+        $this->assertSame(404, $response['status']);
+        $this->assertSame('https://app.example', $response['headers']['Access-Control-Allow-Origin']);
     }
 }
