@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    name: Client (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Check that type declarations were emitted
+        run: test -s dist/esm/TurboPush.d.ts && test -s dist/cjs/TurboPush.d.ts
+
+      - name: Jest
+        run: npm test -- --coverage
+
+  server:
+    name: Server (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: fileinfo
+          coverage: none
+          tools: composer
+
+      - name: Install
+        run: composer install --no-progress --no-interaction
+
+      - name: PHP lint
+        run: find php tests/php examples demo TurboPushEndpoint.php -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: PHPUnit
+        run: vendor/bin/phpunit
