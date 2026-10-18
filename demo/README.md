@@ -1,48 +1,43 @@
 # TurboPush Demo
 
-This demo shows TurboPush in action with a functional HTML upload form.
+A working upload page: pick files, watch per-file progress, pause, resume,
+cancel, and retry failed files.
+
+## Run it
+
+From the project root:
+
+```bash
+npm install
+npm run demo        # builds dist/ and starts php -S localhost:8000
+```
+
+Then open http://localhost:8000/demo/.
+
+The page imports the built client from `dist/esm/TurboPush.js`, so run
+`npm run build` again after changing `TurboPush.ts`.
 
 ## Files
 
-- `index.html` - The main upload form UI
-- `demo.js` - Demo application logic
-- `TurboPush.js` - Compiled JavaScript version of TurboPush for browser use
+- `index.html` - the upload form
+- `demo.js` - demo logic, using the public API only
+- `upload.php` - the demo endpoint
 
-## How to Use
+## Where uploads go
 
-1. Start a web server in the project root directory:
-```bash
-   # Using PHP
-   php -S localhost:8000
+`upload.php` stores finished files in `turbopush-demo/uploads` under the
+system temp directory (usually `/tmp/turbopush-demo/uploads`), chunks in
+`turbopush-demo/chunks`, and a log in `turbopush-demo/turbopush.log`.
+Nothing is written inside the project.
 
-   # Using Python
-   python -m http.server 8000
+## Options on the page
 
-   # Using Node.js
-   npx http-server -p 8000
-```
+- **Simulate failures** adds `?simulateFailures=1` to the endpoint URL. The
+  demo endpoint then answers the first attempt of chunks 1, 5, 9, ... with
+  a 503, and the event log shows the client retrying with backoff.
+- **Resume after reload** turns on the `resumable` option. Start a large
+  upload, reload the page, pick the same file again and upload: only the
+  missing chunks are sent.
 
-2. Open your browser to: `http://localhost:8000/demo/`
-
-3. Select one or multiple files
-
-4. Click "Upload Files" to start the upload
-
-5. Use "Pause" to pause uploads, "Resume" to continue
-
-6. Use "Cancel" to abort all uploads
-
-## Features
-
-- ✅ Single and multiple file uploads
-- ✅ Real-time progress (percentage, speed, ETA)
-- ✅ Pause/Resume functionality
-- ✅ Individual file tracking
-- ✅ Overall statistics
-- ✅ Error handling with visual feedback
-
-## Notes
-
-- The demo uses the compiled JavaScript version (`TurboPush.js`) instead of the TypeScript source
-- Uploads are sent to `../examples/upload-endpoint.php`
-- Make sure the upload directories have write permissions
+PHP's built-in server uses your CLI `php.ini`. The demo uses 1MB chunks,
+which fits PHP's default `upload_max_filesize` of 2MB.

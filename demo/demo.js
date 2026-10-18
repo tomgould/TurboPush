@@ -1,11 +1,15 @@
-import { TurboPush } from './TurboPush.js';
+// Built by `npm run build`
+import { TurboPush } from '../dist/esm/TurboPush.js';
 
 // DOM Elements
 const fileInput = document.getElementById('fileInput');
 const uploadBtn = document.getElementById('uploadBtn');
 const pauseBtn = document.getElementById('pauseBtn');
 const cancelBtn = document.getElementById('cancelBtn');
+const simulateFailures = document.getElementById('simulateFailures');
+const resumable = document.getElementById('resumable');
 const progressList = document.getElementById('progressList');
+const eventLog = document.getElementById('eventLog');
 const statsContainer = document.getElementById('stats');
 const totalFilesEl = document.getElementById('totalFiles');
 const completedFilesEl = document.getElementById('completedFiles');
@@ -20,11 +24,12 @@ let isPaused = false;
 // Initialize TurboPush instance
 function initUploader() {
     uploader = new TurboPush({
-        endpoint: '../examples/upload-endpoint.php',
-        chunkSize: 1024 * 1024,        // 1MB chunks
-        maxConcurrentUploads: 12,       // 5 parallel uploads
+        endpoint: 'upload.php' + (simulateFailures.checked ? '?simulateFailures=1' : ''),
+        chunkSize: 1024 * 1024,        // 1MB chunks (PHP's default upload limit is 2MB)
+        maxConcurrentUploads: 4,       // 4 chunk requests at a time
         maxRetries: 3,                 // Retry failed chunks 3 times
-        retryDelay: 1000               // 1s between retries
+        retryDelay: 1000,              // 1s before the first retry, then 2s, 4s
+        resumable: resumable.checked   // Continue after a page reload
     });
 
     // Register callbacks
@@ -32,12 +37,13 @@ function initUploader() {
         .onProgress(handleProgress)
         .onFileComplete(handleFileComplete)
         .onComplete(handleComplete)
-        .onError(handleError);
+        .onError(handleError)
+        .onRetry(handleRetry);
 }
 
 // Format bytes to human readable
 function formatBytes(bytes, decimals = 2) {
-    if (bytes === 0) return '0 B';
+    if (!bytes) return '0 B';
     const k = 1024;
     const dm = decimals < 0 ? 0 : decimals;
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -53,25 +59,35 @@ function formatTime(seconds) {
     return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
 }
 
-// Create progress element for a file
+// Add a line to the event log
+function logEvent(message) {
+    const line = document.createElement('div');
+    line.textContent = `${new Date().toLocaleTimeString()}  ${message}`;
+    eventLog.appendChild(line);
+    eventLog.scrollTop = eventLog.scrollHeight;
+}
+
+// Create progress element for a file (textContent only: file names are user input)
 function createProgressElement(progress) {
     const div = document.createElement('div');
     div.className = 'file-progress';
     div.id = `file-${progress.fileId}`;
 
     div.innerHTML = `
-        <div class="file-name">${progress.fileName}</div>
+        <div class="file-name"></div>
         <div class="progress-bar-container">
             <div class="progress-bar" style="width: 0%">0%</div>
         </div>
         <div class="file-details">
             <span>
                 <span class="status status-pending">Pending</span>
-                <span class="file-size">${formatBytes(progress.totalSize)}</span>
+                <span class="file-size"></span>
             </span>
             <span class="file-speed">0 B/s | ETA: --</span>
         </div>
     `;
+    div.querySelector('.file-name').textContent = progress.fileName;
+    div.querySelector('.file-size').textContent = formatBytes(progress.totalSize);
 
     return div;
 }
@@ -84,7 +100,6 @@ function updateProgressElement(progress) {
     const progressBar = element.querySelector('.progress-bar');
     const status = element.querySelector('.status');
     const speed = element.querySelector('.file-speed');
-    const errorMsg = element.querySelector('.error-message');
 
     // Update progress bar
     const percentage = Math.round(progress.percentage);
@@ -101,14 +116,23 @@ function updateProgressElement(progress) {
         speed.textContent = `${formatBytes(progress.speed)}/s | ETA: ${formatTime(progress.remainingTime)}`;
     } else if (progress.status === 'completed') {
         speed.textContent = 'Upload complete!';
+        if (progress.result && progress.result.fileName && !element.querySelector('.stored-name')) {
+            const stored = document.createElement('div');
+            stored.className = 'stored-name';
+            stored.textContent = `Stored as ${progress.result.fileName}`;
+            element.appendChild(stored);
+        }
     } else if (progress.status === 'failed') {
         speed.textContent = 'Upload failed';
-        if (progress.error && !errorMsg) {
-            const error = document.createElement('div');
-            error.className = 'error-message';
-            error.textContent = progress.error;
-            element.querySelector('.file-details').appendChild(error);
+        let errorMsg = element.querySelector('.error-message');
+        if (!errorMsg) {
+            errorMsg = document.createElement('div');
+            errorMsg.className = 'error-message';
+            element.appendChild(errorMsg);
         }
+        errorMsg.textContent = progress.error || 'Unknown error';
+    } else if (progress.status === 'paused') {
+        speed.textContent = 'Paused';
     }
 }
 
@@ -135,66 +159,70 @@ function handleProgress(progressArray) {
         : 0;
     overallProgressEl.textContent = `${overallPercentage}%`;
 
-    // Calculate current average speed from active uploads
-    let totalSpeed = 0;
-    let activeCount = 0;
-    progressArray.forEach(p => {
-        if (p.status === 'uploading' && p.speed > 0) {
-            totalSpeed += p.speed;
-            activeCount++;
-        }
-    });
-    const currentSpeed = activeCount > 0 ? totalSpeed : 0;
+    // Calculate current speed from active uploads
+    const currentSpeed = progressArray
+        .filter(p => p.status === 'uploading')
+        .reduce((total, p) => total + p.speed, 0);
     avgSpeedEl.textContent = `${formatBytes(currentSpeed)}/s`;
 }
 
 // Handle individual file completion
-function handleFileComplete(fileName, fileId) {
-    console.log(`✓ Completed: ${fileName}`);
+function handleFileComplete(fileName, fileId, result) {
+    logEvent(`Completed ${fileName}` + (result.fileName && result.fileName !== fileName ? ` (stored as ${result.fileName})` : ''));
 }
 
 // Handle all uploads complete
 function handleComplete(stats) {
-    console.log('All uploads complete!', stats);
+    logEvent(`All done: ${stats.completedFiles} of ${stats.totalFiles} file(s) uploaded in ${Math.round(stats.duration)}s`);
 
     // Update final stats
     avgSpeedEl.textContent = stats.averageSpeed
         ? `${formatBytes(stats.averageSpeed)}/s (avg)`
         : '0 B/s';
 
-    // Update button states
-    uploadBtn.disabled = true;
+    // Update button states: failed files can be retried with push()
+    uploadBtn.textContent = stats.failedFiles > 0 ? 'Retry Failed' : 'Upload Files';
+    uploadBtn.disabled = stats.failedFiles === 0;
     pauseBtn.disabled = true;
-    cancelBtn.disabled = true;
-
-    // Alert user
-    alert(`Upload complete!\n${stats.completedFiles} of ${stats.totalFiles} files uploaded successfully.\nTotal time: ${Math.round(stats.duration)}s`);
+    cancelBtn.disabled = stats.failedFiles === 0;
+    fileInput.disabled = false;
 }
 
 // Handle upload errors
-function handleError(error, fileName, fileId) {
-    console.error(`✗ Failed: ${fileName}`, error);
+function handleError(error, fileName) {
+    logEvent(`Failed ${fileName}: ${error.message}` + (error.status ? ` (HTTP ${error.status})` : ''));
+}
+
+// Handle retries
+function handleRetry(info) {
+    const what = info.chunkIndex === null ? 'finalize' : `chunk ${info.chunkIndex}`;
+    logEvent(`${info.fileName}: ${what} failed (${info.error.message}), retry ${info.attempt} in ${info.delay}ms`);
 }
 
 // Event Listeners
 fileInput.addEventListener('change', (e) => {
     if (e.target.files.length > 0) {
+        uploader = null;
         uploadBtn.disabled = false;
+        uploadBtn.textContent = 'Upload Files';
         progressList.innerHTML = '';
+        eventLog.innerHTML = '';
         statsContainer.style.display = 'none';
     }
 });
 
 uploadBtn.addEventListener('click', async () => {
     const files = fileInput.files;
-    if (files.length === 0) {
+    if (!uploader && files.length === 0) {
         alert('Please select files to upload');
         return;
     }
 
-    // Initialize uploader and add files
-    initUploader();
-    uploader.addFiles(files);
+    // Initialize uploader and add files (a second click retries failed files)
+    if (!uploader) {
+        initUploader();
+        uploader.addFiles(files);
+    }
 
     // Update UI
     statsContainer.style.display = 'block';
@@ -207,7 +235,7 @@ uploadBtn.addEventListener('click', async () => {
     try {
         await uploader.push();
     } catch (error) {
-        console.error('Upload error:', error);
+        logEvent(`Upload error: ${error.message}`);
     }
 });
 
@@ -217,15 +245,15 @@ pauseBtn.addEventListener('click', async () => {
     if (isPaused) {
         // Resume
         pauseBtn.textContent = 'Pause';
-        pauseBtn.disabled = true; // Disable during resume
-        await uploader.resume();
-        pauseBtn.disabled = false;
         isPaused = false;
+        logEvent('Resumed');
+        await uploader.resume();
     } else {
         // Pause
         uploader.pause();
         pauseBtn.textContent = 'Resume';
         isPaused = true;
+        logEvent('Paused');
     }
 });
 
@@ -234,17 +262,19 @@ cancelBtn.addEventListener('click', () => {
 
     if (confirm('Are you sure you want to cancel all uploads?')) {
         uploader.cancel();
+        uploader = null;
 
         // Reset UI
         progressList.innerHTML = '';
         statsContainer.style.display = 'none';
         uploadBtn.disabled = true;
+        uploadBtn.textContent = 'Upload Files';
         pauseBtn.disabled = true;
         cancelBtn.disabled = true;
         fileInput.disabled = false;
         fileInput.value = '';
         isPaused = false;
         pauseBtn.textContent = 'Pause';
+        logEvent('Cancelled');
     }
 });
-

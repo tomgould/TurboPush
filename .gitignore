@@ -49,3 +49,6 @@ vendor/
 composer.lock
 .phpunit.result.cache
 .phpunit.cache/
+
+# npm pack output
+*.tgz

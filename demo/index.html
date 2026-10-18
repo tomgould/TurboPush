@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TurboPush Demo</title>
+    <link rel="icon" href="data:,">
     <style>
         * {
             margin: 0;
@@ -225,6 +226,48 @@
             font-size: 12px;
             margin-top: 5px;
         }
+
+        .options {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            color: #333;
+        }
+
+        .options label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+        }
+
+        .stored-name {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .event-log {
+            margin-top: 20px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            padding: 10px 15px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+            color: #444;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .event-log:empty {
+            display: none;
+        }
+
+        .event-log div {
+            padding: 2px 0;
+        }
     </style>
 </head>
 <body>
@@ -236,6 +279,17 @@
                 <input type="file" id="fileInput" multiple>
             </div>
             
+            <div class="options">
+                <label>
+                    <input type="checkbox" id="simulateFailures">
+                    Simulate failures (the first attempt of chunks 1, 5, 9, ... fails)
+                </label>
+                <label>
+                    <input type="checkbox" id="resumable">
+                    Resume after reload
+                </label>
+            </div>
+
             <div class="controls">
                 <button id="uploadBtn" class="btn-upload" disabled>Upload Files</button>
                 <button id="pauseBtn" class="btn-pause" disabled>Pause</button>
@@ -267,6 +321,8 @@
         </div>
         
         <div id="progressList" class="progress-list"></div>
+
+        <div id="eventLog" class="event-log" aria-live="polite"></div>
     </div>
     
     <script type="module" src="./demo.js"></script>
