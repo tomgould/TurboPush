@@ -1,18 +1,19 @@
 /**
- * TurboPush - High-Performance Chunked File Upload Library
+ * TurboPush - Chunked File Upload Library
  *
- * A modern, production-ready file upload library with parallel chunk uploads,
- * automatic retry logic, and real-time progress tracking. Designed for uploading
- * large files efficiently and reliably.
+ * Splits files into chunks and uploads them in parallel, with retries and
+ * exponential backoff, pause/resume/cancel, progress events and optional
+ * resuming across page reloads. Designed for uploading large files
+ * efficiently and reliably.
  *
  * @module TurboPush
- * @version 1.0.0
+ * @version 1.1.0
  * @license MIT
  * @author TomGould
  *
  * @example
  * ```typescript
- * import { TurboPush } from './TurboPush';
+ * import { TurboPush } from 'turbopush';
  *
  * const uploader = new TurboPush({
  *     endpoint: '/api/upload',
@@ -45,41 +46,49 @@ interface TurboPushConfig {
      * Size of each chunk in bytes (default: 1MB)
      * Larger chunks = fewer requests but less granular progress
      * Smaller chunks = more requests but better progress tracking
+     * Must not exceed the server's chunk size limit
      * @default 1048576 (1MB)
      */
     chunkSize?: number;
 
     /**
-     * Maximum number of concurrent chunk uploads (default: 3, range: 1-10)
+     * Maximum number of chunk requests in flight at once, across all files
+     * (default: 3, range: 1-10)
      * Higher values upload faster but use more bandwidth/connections
      * @default 3
      */
     maxConcurrentUploads?: number;
 
     /**
-     * Maximum retry attempts for failed chunks (default: 3)
+     * Maximum retry attempts for a failed chunk or finalize request (default: 3)
      * Set to 0 to disable retries
      * @default 3
      */
     maxRetries?: number;
 
     /**
-     * Base delay in milliseconds between retry attempts (default: 1000ms)
-     * Actual delay = retryDelay * attemptNumber (exponential backoff)
+     * Base delay in milliseconds before the first retry (default: 1000ms, minimum 100ms)
+     * The delay doubles with each attempt, with random jitter, up to maxRetryDelay
      * @default 1000
      */
     retryDelay?: number;
 
     /**
-     * Request timeout in milliseconds (default: 30000ms / 30s)
-     * Requests exceeding this duration will be aborted
+     * Upper limit for the retry delay in milliseconds (default: 30000ms)
+     * @default 30000
+     */
+    maxRetryDelay?: number;
+
+    /**
+     * Request timeout in milliseconds (default: 30000ms / 30s, minimum 5s)
+     * Requests exceeding this duration will be aborted and retried
      * @default 30000
      */
     timeout?: number;
 
     /**
      * Custom HTTP headers to include with each request
-     * Useful for authentication tokens, API keys, etc.
+     * Useful for authentication tokens, CSRF tokens, API keys, etc.
      * @default {}
      */
     headers?: Record<string, string>;
@@ -89,6 +98,40 @@ interface TurboPushConfig {
      * @default false
      */
     withCredentials?: boolean;
+
+    /**
+     * Resume interrupted uploads after a page reload (default: false)
+     * Remembers each file's upload ID in localStorage, keyed by endpoint,
+     * name, size and last-modified time, and asks the server which chunks
+     * it already has before uploading
+     * @default false
+     */
+    resumable?: boolean;
+}
+
+/**
+ * Status of a file upload
+ */
+type UploadStatus = 'pending' | 'uploading' | 'completed' | 'failed' | 'paused';
+
+/**
+ * Data returned by the server when a file has been stored
+ *
+ * The PHP endpoint returns the stored file name (which may differ from the
+ * original after sanitisation or to avoid overwriting an existing file),
+ * the size, and anything added by its onComplete callback.
+ *
+ * @interface UploadResult
+ */
+interface UploadResult {
+    /** Name the file was stored under on the server */
+    fileName?: string;
+
+    /** Stored file size in bytes */
+    fileSize?: number;
+
+    /** Any extra fields returned by the server */
+    [key: string]: unknown;
 }
 
 /**
@@ -122,36 +165,13 @@ interface UploadProgress {
     remainingTime: number;
 
     /** Current status of the file upload */
-    status: 'pending' | 'uploading' | 'completed' | 'failed' | 'paused';
+    status: UploadStatus;
 
     /** Error message if status is 'failed' */
     error?: string;
-}
 
-/**
- * Internal chunk metadata and state
- *
- * @interface ChunkInfo
- * @private
- */
-interface ChunkInfo {
-    /** Zero-based index of this chunk */
-    index: number;
-
-    /** Starting byte position in the file */
-    start: number;
-
-    /** Ending byte position in the file (exclusive) */
-    end: number;
-
-    /** The actual chunk data as a Blob */
-    blob: Blob;
-
-    /** Number of upload attempts made for this chunk */
-    attempts: number;
-
-    /** Whether this chunk has been successfully uploaded */
-    uploaded: boolean;
+    /** Server response data once status is 'completed' */
+    result?: UploadResult;
 }
 
 /**
@@ -186,7 +206,200 @@ interface UploadStats {
 
     /** Average upload speed in bytes per second */
     averageSpeed?: number;
+
+    /** True if the session ended because cancel() was called */
+    cancelled?: boolean;
 }
+
+/**
+ * Information about a retry, passed to onRetry callbacks
+ *
+ * @interface RetryInfo
+ */
+interface RetryInfo {
+    /** Name of the file */
+    fileName: string;
+
+    /** Unique identifier of the file upload */
+    fileId: string;
+
+    /** Index of the chunk being retried, or null for the finalize request */
+    chunkIndex: number | null;
+
+    /** Retry attempt number, starting at 1 */
+    attempt: number;
+
+    /** Delay before the retry in milliseconds */
+    delay: number;
+
+    /** The error that caused the retry */
+    error: TurboPushError;
+}
+
+/**
+ * Kind of failure reported by a TurboPushError
+ *
+ * - network: the request could not be sent or the connection dropped
+ * - timeout: the request took longer than the configured timeout
+ * - http: the server answered with an HTTP error status
+ * - server: the server answered 200 but reported a failure
+ * - invalid_response: the server's answer was not the expected JSON
+ * - cancelled: the upload was cancelled
+ */
+type TurboPushErrorCode = 'network' | 'timeout' | 'http' | 'server' | 'invalid_response' | 'cancelled';
+
+/**
+ * Options for creating a TurboPushError
+ *
+ * @interface TurboPushErrorOptions
+ */
+interface TurboPushErrorOptions {
+    code: TurboPushErrorCode;
+    status?: number;
+    retryable?: boolean;
+    chunkIndex?: number;
+    data?: unknown;
+    cause?: unknown;
+}
+
+/**
+ * Error passed to onError callbacks
+ *
+ * Carries the server's error message when there is one, plus details for
+ * deciding what to do next.
+ *
+ * @class TurboPushError
+ * @since 1.1.0
+ *
+ * @example
+ * ```typescript
+ * uploader.onError((error) => {
+ *     if (error instanceof TurboPushError && error.status === 415) {
+ *         alert('That file type is not allowed');
+ *     }
+ * });
+ * ```
+ */
+export class TurboPushError extends Error {
+    /** Kind of failure */
+    public readonly code: TurboPushErrorCode;
+
+    /** HTTP status code, if the server answered */
+    public readonly status?: number;
+
+    /** Whether TurboPush considers the failure temporary */
+    public readonly retryable: boolean;
+
+    /** Index of the chunk that failed, if the failure was a chunk upload */
+    public readonly chunkIndex?: number;
+
+    /** The `data` field of the server's error response, if any */
+    public readonly data?: unknown;
+
+    /** The underlying error, if any */
+    public readonly cause?: unknown;
+
+    constructor(message: string, options: TurboPushErrorOptions) {
+        super(message);
+        this.name = 'TurboPushError';
+        this.code = options.code;
+        this.status = options.status;
+        this.retryable = options.retryable ?? false;
+        this.chunkIndex = options.chunkIndex;
+        this.data = options.data;
+        this.cause = options.cause;
+    }
+}
+
+/**
+ * Internal chunk metadata and state
+ *
+ * @interface ChunkInfo
+ * @private
+ */
+interface ChunkInfo {
+    /** Zero-based index of this chunk */
+    index: number;
+
+    /** Starting byte position in the file */
+    start: number;
+
+    /** Ending byte position in the file (exclusive) */
+    end: number;
+
+    /** The actual chunk data as a Blob */
+    blob: Blob;
+
+    /** Number of retries made for this chunk */
+    attempts: number;
+
+    /** Upload state: waiting to be sent, in flight, waiting to retry, or done */
+    state: 'pending' | 'uploading' | 'waiting' | 'done';
+}
+
+/**
+ * Internal state for one queued file
+ *
+ * @interface FileEntry
+ * @private
+ */
+interface FileEntry {
+    file: File;
+    progress: UploadProgress;
+    chunks: ChunkInfo[] | null;
+    /** Chunk size used to create the chunks */
+    chunkSize: number;
+    /** True once any chunk has been sent, so the server may hold data */
+    started: boolean;
+    /** True while the finalize request is running */
+    finalizing: boolean;
+    /** True if the upload ID was restored from storage (resumable mode) */
+    restored: boolean;
+    /** Timer handles of chunks waiting to be retried */
+    retryTimers: Set<ReturnType<typeof setTimeout>>;
+    /** Speed calculation state */
+    lastSpeedTime: number;
+    lastSpeedBytes: number;
+}
+
+/**
+ * Internal state of one push() call
+ *
+ * @interface Session
+ * @private
+ */
+interface Session {
+    fileIds: string[];
+    promise: Promise<UploadStats>;
+    finish: () => void;
+    cancelled: boolean;
+    cancelledStats?: UploadStats;
+    startBytes: number;
+    activeChunks: number;
+    timers: Set<ReturnType<typeof setTimeout>>;
+}
+
+/**
+ * An in-flight request, so it can be aborted
+ *
+ * @interface InFlightRequest
+ * @private
+ */
+interface InFlightRequest {
+    fileId: string;
+    kind: 'chunk' | 'finalize' | 'status';
+    controller: AbortController;
+    reason?: 'paused' | 'cancelled' | 'failed' | 'timeout';
+}
+
+/**
+ * Thrown internally when a chunk request was aborted by pause()
+ * @private
+ */
+class PausedSignal extends Error {}
+
+/** Upload IDs the server accepts */
+const UPLOAD_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
 
 /**
  * TurboPush - Main file upload class
@@ -201,17 +414,14 @@ export class TurboPush {
     /** Validated and normalized configuration with all defaults applied */
     private config: Required<TurboPushConfig>;
 
-    /** Map of fileId -> File object for all queued files */
-    private files: Map<string, File> = new Map();
+    /** Map of fileId -> file state, in the order files were added */
+    private entries: Map<string, FileEntry> = new Map();
 
-    /** Map of fileId -> upload progress for tracking */
-    private fileProgress: Map<string, UploadProgress> = new Map();
+    /** In-flight requests by key, for pause and cancel */
+    private inFlight: Map<string, InFlightRequest> = new Map();
 
-    /** Map of fileId -> array of chunk metadata */
-    private fileChunks: Map<string, ChunkInfo[]> = new Map();
-
-    /** Map of upload keys -> AbortController for cancellation */
-    private activeUploads: Map<string, AbortController> = new Map();
+    /** The running push() session, if any */
+    private session: Session | null = null;
 
     /** Aggregate statistics for the entire upload session */
     private stats: UploadStats;
@@ -220,13 +430,16 @@ export class TurboPush {
     private progressCallback?: (progress: UploadProgress[]) => void;
 
     /** Callback function when individual file completes */
-    private fileCompleteCallback?: (fileName: string, fileId: string) => void;
+    private fileCompleteCallback?: (fileName: string, fileId: string, result: UploadResult) => void;
 
     /** Callback function when all uploads complete */
     private completeCallback?: (stats: UploadStats) => void;
 
     /** Callback function for error handling */
     private errorCallback?: (error: Error, fileName: string, fileId: string) => void;
+
+    /** Callback function for retries */
+    private retryCallback?: (info: RetryInfo) => void;
 
     /** Whether uploads are currently paused */
     private isPaused: boolean = false;
@@ -249,31 +462,28 @@ export class TurboPush {
      */
     constructor(config: TurboPushConfig) {
         // Validate required configuration
-        if (!config.endpoint) {
+        if (!config || !config.endpoint) {
             throw new Error('TurboPush: endpoint is required');
         }
+
+        const retryDelay = Math.max(100, TurboPush.positive(config.retryDelay, 1000)); // Minimum 100ms
 
         // Apply defaults and constraints to configuration
         this.config = {
             endpoint: config.endpoint,
-            chunkSize: config.chunkSize || 1024 * 1024, // Default 1MB
-            maxConcurrentUploads: Math.max(1, Math.min(10, config.maxConcurrentUploads || 3)), // Clamp 1-10
-            maxRetries: Math.max(0, config.maxRetries || 3), // Minimum 0
-            retryDelay: Math.max(100, config.retryDelay || 1000), // Minimum 100ms
-            timeout: Math.max(5000, config.timeout || 30000), // Minimum 5s
+            chunkSize: TurboPush.positive(config.chunkSize, 1024 * 1024), // Default 1MB
+            maxConcurrentUploads: Math.max(1, Math.min(10, Math.floor(TurboPush.number(config.maxConcurrentUploads, 3)))), // Clamp 1-10
+            maxRetries: Math.max(0, Math.floor(TurboPush.number(config.maxRetries, 3))), // Minimum 0
+            retryDelay,
+            maxRetryDelay: Math.max(retryDelay, TurboPush.number(config.maxRetryDelay, 30000)),
+            timeout: Math.max(5000, TurboPush.positive(config.timeout, 30000)), // Minimum 5s
             headers: config.headers || {},
-            withCredentials: config.withCredentials || false
+            withCredentials: config.withCredentials || false,
+            resumable: config.resumable || false
         };
 
         // Initialize statistics
-        this.stats = {
-            totalFiles: 0,
-            completedFiles: 0,
-            failedFiles: 0,
-            totalBytes: 0,
-            uploadedBytes: 0,
-            startTime: Date.now()
-        };
+        this.stats = TurboPush.emptyStats();
     }
 
     /**
@@ -289,20 +499,48 @@ export class TurboPush {
      * ```
      */
     public addFile(file: File): this {
-        const fileId = this.generateFileId(file);
-        this.files.set(fileId, file);
+        let fileId: string | null = null;
+        let restored = false;
 
-        // Initialize progress tracking for this file
-        this.fileProgress.set(fileId, {
+        // In resumable mode, reuse the ID of an earlier, unfinished upload of this file
+        if (this.config.resumable) {
+            const key = this.storageKey(file);
+            const stored = this.storageGet(key);
+            const valid = stored !== null && UPLOAD_ID_PATTERN.test(stored);
+            if (valid && !this.entries.has(stored!)) {
+                fileId = stored!;
+                restored = true;
+            } else if (!valid) {
+                fileId = this.generateFileId(file);
+                this.storageSet(key, fileId);
+            }
+        }
+
+        if (fileId === null) {
+            fileId = this.generateFileId(file);
+        }
+
+        this.entries.set(fileId, {
             file,
-            fileName: file.name,
-            fileId,
-            totalSize: file.size,
-            uploadedSize: 0,
-            percentage: 0,
-            speed: 0,
-            remainingTime: 0,
-            status: 'pending'
+            progress: {
+                file,
+                fileName: file.name,
+                fileId,
+                totalSize: file.size,
+                uploadedSize: 0,
+                percentage: 0,
+                speed: 0,
+                remainingTime: 0,
+                status: 'pending'
+            },
+            chunks: null,
+            chunkSize: this.config.chunkSize,
+            started: false,
+            finalizing: false,
+            restored,
+            retryTimers: new Set(),
+            lastSpeedTime: 0,
+            lastSpeedBytes: 0
         });
 
         // Update session statistics
@@ -334,7 +572,7 @@ export class TurboPush {
 
     /**
      * Registers a callback for progress updates
-     * Called whenever upload progress changes for any file
+     * Called whenever upload progress or a file's status changes
      *
      * @param {Function} callback - Callback receiving array of progress objects
      * @returns {TurboPush} This instance for method chaining
@@ -357,24 +595,25 @@ export class TurboPush {
      * Registers a callback for individual file completion
      * Called when each file finishes uploading successfully
      *
-     * @param {Function} callback - Callback receiving fileName and fileId
+     * @param {Function} callback - Callback receiving fileName, fileId and the server's response data
      * @returns {TurboPush} This instance for method chaining
      *
      * @example
      * ```typescript
-     * uploader.onFileComplete((fileName, fileId) => {
-     *     console.log(`Completed: ${fileName}`);
+     * uploader.onFileComplete((fileName, fileId, result) => {
+     *     console.log(`Completed: ${fileName}, stored as ${result.fileName}`);
      * });
      * ```
      */
-    public onFileComplete(callback: (fileName: string, fileId: string) => void): this {
+    public onFileComplete(callback: (fileName: string, fileId: string, result: UploadResult) => void): this {
         this.fileCompleteCallback = callback;
         return this;
     }
 
     /**
      * Registers a callback for upload session completion
-     * Called once when all files have finished (successfully or with errors)
+     * Called once when all files have finished (successfully or with errors).
+     * Not called when the session is cancelled.
      *
      * @param {Function} callback - Callback receiving final statistics
      * @returns {TurboPush} This instance for method chaining
@@ -394,7 +633,8 @@ export class TurboPush {
 
     /**
      * Registers a callback for error handling
-     * Called whenever a file fails to upload after all retries
+     * Called whenever a file fails to upload after all retries.
+     * The error is a TurboPushError with the server's message and status.
      *
      * @param {Function} callback - Callback receiving error, fileName, and fileId
      * @returns {TurboPush} This instance for method chaining
@@ -412,7 +652,26 @@ export class TurboPush {
     }
 
     /**
-     * Updates the chunk size for future uploads
+     * Registers a callback for retries
+     * Called before a failed chunk or finalize request is retried
+     *
+     * @param {Function} callback - Callback receiving retry information
+     * @returns {TurboPush} This instance for method chaining
+     *
+     * @example
+     * ```typescript
+     * uploader.onRetry(({ fileName, chunkIndex, attempt, delay }) => {
+     *     console.warn(`Retrying chunk ${chunkIndex} of ${fileName} in ${delay}ms (attempt ${attempt})`);
+     * });
+     * ```
+     */
+    public onRetry(callback: (info: RetryInfo) => void): this {
+        this.retryCallback = callback;
+        return this;
+    }
+
+    /**
+     * Updates the chunk size for files that have not started uploading
      *
      * @param {number} bytes - New chunk size in bytes (minimum 64KB)
      * @returns {TurboPush} This instance for method chaining
@@ -439,7 +698,8 @@ export class TurboPush {
      * ```
      */
     public setMaxConcurrentUploads(count: number): this {
-        this.config.maxConcurrentUploads = Math.max(1, Math.min(10, count));
+        this.config.maxConcurrentUploads = Math.max(1, Math.min(10, Math.floor(count)));
+        this.pump();
         return this;
     }
 
@@ -455,13 +715,19 @@ export class TurboPush {
      * ```
      */
     public setMaxRetries(count: number): this {
-        this.config.maxRetries = Math.max(0, count);
+        this.config.maxRetries = Math.max(0, Math.floor(count));
         return this;
     }
 
     /**
      * Starts the upload process for all queued files
-     * Creates chunks and uploads them in parallel according to configuration
+     *
+     * Uploads every file that is not already completed, so calling push()
+     * again after some files failed retries just those files, sending only
+     * the chunks the server does not have yet. If an upload is already
+     * running, returns its promise. The promise resolves once every file has
+     * completed or failed (or the session was cancelled); it does not reject
+     * when files fail, check the statistics or use onError.
      *
      * @returns {Promise<UploadStats>} Promise resolving to final upload statistics
      * @throws {Error} If no files are queued
@@ -472,38 +738,34 @@ export class TurboPush {
      * console.log(`Uploaded ${stats.completedFiles} files in ${stats.duration}s`);
      * ```
      */
-    public async push(): Promise<UploadStats> {
-        if (this.files.size === 0) {
-            throw new Error('TurboPush: No files to upload');
+    public push(): Promise<UploadStats> {
+        if (this.entries.size === 0) {
+            return Promise.reject(new Error('TurboPush: No files to upload'));
         }
 
-        this.stats.startTime = Date.now();
+        if (this.session) {
+            if (this.isPaused) {
+                this.resume();
+            }
+            return this.session.promise;
+        }
+
         this.isPaused = false;
 
-        // Create chunks for all queued files
-        for (const [fileId, file] of this.files) {
-            this.fileChunks.set(fileId, this.createChunks(file));
-        }
-
-        // Start uploading all files concurrently
-        const uploadPromises = Array.from(this.files.keys()).map(fileId =>
-            this.uploadFile(fileId)
-        );
-
-        // Wait for all uploads to complete (successful or failed)
-        await Promise.allSettled(uploadPromises);
-
-        // Calculate final statistics
-        this.stats.endTime = Date.now();
-        this.stats.duration = (this.stats.endTime - this.stats.startTime) / 1000;
-        this.stats.averageSpeed = this.stats.totalBytes / (this.stats.duration || 1);
-
-        // Notify completion callback
-        if (this.completeCallback) {
-            this.completeCallback(this.stats);
-        }
-
-        return this.stats;
+        let finish: () => void = () => undefined;
+        const finished = new Promise<void>(resolve => { finish = resolve; });
+        const session: Session = {
+            fileIds: [],
+            promise: Promise.resolve(this.stats),
+            finish: () => finish(),
+            cancelled: false,
+            startBytes: this.stats.uploadedBytes,
+            activeChunks: 0,
+            timers: new Set()
+        };
+        this.session = session;
+        session.promise = this.runSession(session, finished);
+        return session.promise;
     }
 
     /**
@@ -512,14 +774,15 @@ export class TurboPush {
      *
      * @returns {Promise<UploadStats>} Promise resolving to final upload statistics
      */
-    public async upload(): Promise<UploadStats> {
+    public upload(): Promise<UploadStats> {
         return this.push();
     }
 
     /**
      * Pauses all active uploads
-     * Aborts all in-progress requests and marks files as paused
-     * Files can be resumed later using resume()
+     * Aborts in-progress chunk requests and marks files as paused.
+     * Aborted chunks are sent again on resume and do not count as retries.
+     * The promise returned by push() stays pending until the uploads finish.
      *
      * @returns {void}
      *
@@ -533,25 +796,35 @@ export class TurboPush {
     public pause(): void {
         this.isPaused = true;
 
-        // Abort all active uploads
-        for (const [key, controller] of this.activeUploads) {
-            controller.abort();
+        // Abort all active chunk uploads
+        for (const request of this.inFlight.values()) {
+            if (request.kind === 'chunk') {
+                request.reason = 'paused';
+                request.controller.abort();
+            }
         }
-        this.activeUploads.clear();
 
         // Update file statuses
-        for (const progress of this.fileProgress.values()) {
-            if (progress.status === 'uploading') {
-                progress.status = 'paused';
+        let changed = false;
+        for (const entry of this.entries.values()) {
+            if (entry.progress.status === 'uploading') {
+                entry.progress.status = 'paused';
+                entry.progress.speed = 0;
+                entry.progress.remainingTime = 0;
+                changed = true;
             }
+        }
+        if (changed) {
+            this.emitProgress();
         }
     }
 
     /**
      * Resumes paused uploads
-     * Continues uploading files that were paused or pending
+     * Continues the running session, or starts a new one if files are
+     * waiting and nothing is running.
      *
-     * @returns {Promise<void>} Promise that resolves when resume is complete
+     * @returns {Promise<void>} Promise that resolves when the uploads have finished
      *
      * @example
      * ```typescript
@@ -563,22 +836,39 @@ export class TurboPush {
     public async resume(): Promise<void> {
         this.isPaused = false;
 
-        // Find all files that need to be resumed
-        const filesToResume = Array.from(this.fileProgress.entries())
-            .filter(([_, progress]) =>
-                progress.status === 'paused' || progress.status === 'pending'
-            )
-            .map(([fileId, _]) => fileId);
+        if (!this.session) {
+            const waiting = Array.from(this.entries.values())
+                .some(entry => entry.progress.status === 'paused' || entry.progress.status === 'pending');
+            if (waiting) {
+                await this.push();
+            }
+            return;
+        }
 
-        // Resume uploading
-        const uploadPromises = filesToResume.map(fileId => this.uploadFile(fileId));
-        await Promise.allSettled(uploadPromises);
+        const session = this.session;
+        let changed = false;
+        for (const entry of this.entries.values()) {
+            if (entry.progress.status === 'paused') {
+                entry.progress.status = 'uploading';
+                entry.lastSpeedTime = Date.now();
+                entry.lastSpeedBytes = entry.progress.uploadedSize;
+                changed = true;
+            }
+        }
+        if (changed) {
+            this.emitProgress();
+        }
+
+        this.pump();
+        await session.promise;
     }
 
     /**
      * Cancels all uploads and clears the queue
-     * Aborts all active requests and removes all queued files
-     * Cannot be resumed after cancellation
+     * Aborts all active requests, asks the server to delete the chunks of
+     * unfinished files, removes all queued files and resets the statistics.
+     * A pending push() promise resolves with `cancelled: true`; onComplete
+     * is not called. Cannot be resumed after cancellation.
      *
      * @returns {void}
      *
@@ -588,10 +878,48 @@ export class TurboPush {
      * ```
      */
     public cancel(): void {
-        this.pause();
-        this.files.clear();
-        this.fileProgress.clear();
-        this.fileChunks.clear();
+        const session = this.session;
+
+        // Abort all active requests
+        for (const request of this.inFlight.values()) {
+            request.reason = 'cancelled';
+            request.controller.abort();
+        }
+
+        // Tell the server to drop chunks of unfinished uploads
+        for (const [fileId, entry] of this.entries) {
+            for (const timer of entry.retryTimers) {
+                clearTimeout(timer);
+            }
+            if (entry.progress.status !== 'completed') {
+                if (entry.started || entry.restored) {
+                    this.sendAbort(fileId);
+                }
+                this.storageRemove(entry);
+            }
+        }
+
+        if (session) {
+            session.cancelled = true;
+            for (const timer of session.timers) {
+                clearTimeout(timer);
+            }
+            const endTime = Date.now();
+            const duration = (endTime - this.stats.startTime) / 1000;
+            session.cancelledStats = {
+                ...this.stats,
+                endTime,
+                duration,
+                averageSpeed: (this.stats.uploadedBytes - session.startBytes) / (duration || 1),
+                cancelled: true
+            };
+            this.session = null;
+            session.finish();
+        }
+
+        this.entries.clear();
+        this.isPaused = false;
+        this.stats = TurboPush.emptyStats();
     }
 
     /**
@@ -624,7 +952,7 @@ export class TurboPush {
      * ```
      */
     public getProgress(): UploadProgress[] {
-        return Array.from(this.fileProgress.values());
+        return Array.from(this.entries.values(), entry => entry.progress);
     }
 
     /**
@@ -642,9 +970,9 @@ export class TurboPush {
      * ```
      */
     public getFileProgress(fileName: string): UploadProgress | undefined {
-        for (const progress of this.fileProgress.values()) {
-            if (progress.fileName === fileName) {
-                return progress;
+        for (const entry of this.entries.values()) {
+            if (entry.progress.fileName === fileName) {
+                return entry.progress;
             }
         }
         return undefined;
@@ -677,237 +1005,449 @@ export class TurboPush {
      * ```
      */
     public getQueueSize(): number {
-        return this.files.size;
+        return this.entries.size;
     }
 
     /**
-     * Uploads a single file by uploading all its chunks
-     * Handles progress tracking, error handling, and finalization
+     * Runs one upload session until every file has completed or failed
      *
      * @private
-     * @param {string} fileId - Unique identifier for the file
-     * @returns {Promise<void>} Promise that resolves when file upload completes
-     * @throws {Error} If file is not found or upload fails
+     * @param {Session} session - The session
+     * @param {Promise<void>} finished - Resolves when all files are done or the session is cancelled
+     * @returns {Promise<UploadStats>} Final statistics
      */
-    private async uploadFile(fileId: string): Promise<void> {
-        const file = this.files.get(fileId);
-        const chunks = this.fileChunks.get(fileId);
-        const progress = this.fileProgress.get(fileId);
+    private async runSession(session: Session, finished: Promise<void>): Promise<UploadStats> {
+        this.stats.startTime = Date.now();
+        delete this.stats.endTime;
+        delete this.stats.duration;
+        delete this.stats.averageSpeed;
 
-        if (!file || !chunks || !progress) {
-            throw new Error(`TurboPush: File not found: ${fileId}`);
+        // Prepare every file that still needs uploading
+        for (const [fileId, entry] of this.entries) {
+            if (entry.progress.status === 'completed') {
+                continue;
+            }
+            if (entry.progress.status === 'failed') {
+                this.stats.failedFiles--;
+                delete entry.progress.error;
+            }
+            if (!entry.chunks) {
+                entry.chunkSize = this.config.chunkSize;
+                entry.chunks = this.createChunks(entry.file, entry.chunkSize);
+            }
+            // Give every unfinished chunk a fresh retry budget
+            for (const chunk of entry.chunks) {
+                chunk.attempts = 0;
+                if (chunk.state !== 'done') {
+                    chunk.state = 'pending';
+                }
+            }
+            entry.progress.status = 'pending';
+            session.fileIds.push(fileId);
         }
 
-        progress.status = 'uploading';
-        const startTime = Date.now();
-        let lastUpdate = startTime;
-        let lastUploadedSize = 0;
+        // Ask the server what it already has for restored uploads
+        if (this.config.resumable) {
+            await Promise.all(session.fileIds.map(fileId => this.restoreFromServer(session, fileId)));
+            session.startBytes = this.stats.uploadedBytes;
+        }
+
+        if (!session.cancelled) {
+            for (const fileId of session.fileIds) {
+                const entry = this.entries.get(fileId);
+                if (entry && entry.progress.status === 'pending' && entry.chunks!.every(c => c.state === 'done')) {
+                    this.finalizeFile(session, entry);
+                }
+            }
+            this.pump();
+            this.checkSessionDone(session);
+        }
+
+        await finished;
+
+        if (session.cancelled) {
+            return session.cancelledStats!;
+        }
+
+        // Calculate final statistics
+        this.stats.endTime = Date.now();
+        this.stats.duration = (this.stats.endTime - this.stats.startTime) / 1000;
+        this.stats.averageSpeed = (this.stats.uploadedBytes - session.startBytes) / (this.stats.duration || 1);
+
+        // Notify completion callback
+        if (this.completeCallback) {
+            const callback = this.completeCallback;
+            TurboPush.safeCall(() => callback(this.getStats()));
+        }
+
+        return this.getStats();
+    }
+
+    /**
+     * Starts chunk uploads until the concurrency limit is reached
+     * Files are served in the order they were added
+     *
+     * @private
+     * @returns {void}
+     */
+    private pump(): void {
+        const session = this.session;
+        if (!session || session.cancelled || this.isPaused) {
+            return;
+        }
+
+        for (const fileId of session.fileIds) {
+            const entry = this.entries.get(fileId);
+            if (!entry || !entry.chunks || entry.finalizing) {
+                continue;
+            }
+            const status = entry.progress.status;
+            if (status === 'completed' || status === 'failed') {
+                continue;
+            }
+            for (const chunk of entry.chunks) {
+                if (session.activeChunks >= this.config.maxConcurrentUploads) {
+                    return;
+                }
+                if (chunk.state === 'pending') {
+                    this.startChunk(session, entry, chunk);
+                }
+            }
+        }
+    }
+
+    /**
+     * Uploads one chunk and handles the outcome
+     *
+     * @private
+     * @param {Session} session - The session
+     * @param {FileEntry} entry - The file
+     * @param {ChunkInfo} chunk - The chunk
+     * @returns {void}
+     */
+    private startChunk(session: Session, entry: FileEntry, chunk: ChunkInfo): void {
+        chunk.state = 'uploading';
+        session.activeChunks++;
+
+        if (entry.progress.status !== 'uploading') {
+            entry.progress.status = 'uploading';
+            entry.lastSpeedTime = Date.now();
+            entry.lastSpeedBytes = entry.progress.uploadedSize;
+            this.emitProgress();
+        }
+        entry.started = true;
+
+        this.uploadChunk(entry, chunk)
+            .then(
+                () => this.handleChunkSuccess(session, entry, chunk),
+                (error) => this.handleChunkError(session, entry, chunk, error)
+            )
+            .finally(() => {
+                session.activeChunks--;
+                this.pump();
+            });
+    }
+
+    /**
+     * Records a successful chunk and finalizes the file when it was the last one
+     *
+     * @private
+     */
+    private handleChunkSuccess(session: Session, entry: FileEntry, chunk: ChunkInfo): void {
+        if (session.cancelled || entry.progress.status === 'failed') {
+            chunk.state = 'done';
+            return;
+        }
+
+        chunk.state = 'done';
+        this.addUploadedBytes(entry, chunk.end - chunk.start);
+        this.updateSpeed(entry);
+        this.emitProgress();
+
+        if (entry.chunks!.every(c => c.state === 'done')) {
+            this.finalizeFile(session, entry);
+        }
+    }
+
+    /**
+     * Schedules a retry for a failed chunk, or fails the file
+     *
+     * @private
+     */
+    private handleChunkError(session: Session, entry: FileEntry, chunk: ChunkInfo, error: unknown): void {
+        if (session.cancelled) {
+            return;
+        }
+
+        // Aborted by pause() or because another chunk failed: send again later
+        if (error instanceof PausedSignal || entry.progress.status === 'failed') {
+            chunk.state = 'pending';
+            return;
+        }
+
+        const failure = TurboPush.toTurboPushError(error, chunk.index);
+
+        if (failure.retryable && chunk.attempts < this.config.maxRetries) {
+            chunk.attempts++;
+            chunk.state = 'waiting';
+            const delay = this.retryDelayFor(chunk.attempts);
+            this.emitRetry(entry, chunk.index, chunk.attempts, delay, failure);
+
+            const timer = setTimeout(() => {
+                entry.retryTimers.delete(timer);
+                if (chunk.state === 'waiting') {
+                    chunk.state = 'pending';
+                    this.pump();
+                }
+            }, delay);
+            entry.retryTimers.add(timer);
+            return;
+        }
+
+        chunk.state = 'pending';
+        this.failFile(session, entry, failure);
+    }
+
+    /**
+     * Marks a file as failed and stops its other requests
+     *
+     * @private
+     */
+    private failFile(session: Session, entry: FileEntry, error: TurboPushError): void {
+        const status = entry.progress.status;
+        if (status === 'failed' || status === 'completed') {
+            return;
+        }
+
+        // Handle upload failure
+        entry.progress.status = 'failed';
+        entry.progress.error = error.message;
+        entry.progress.speed = 0;
+        entry.progress.remainingTime = 0;
+        this.stats.failedFiles++;
+
+        // Stop the file's other chunks
+        for (const request of this.inFlight.values()) {
+            if (request.fileId === entry.progress.fileId && request.kind === 'chunk') {
+                request.reason = 'failed';
+                request.controller.abort();
+            }
+        }
+        for (const timer of entry.retryTimers) {
+            clearTimeout(timer);
+        }
+        entry.retryTimers.clear();
+        for (const chunk of entry.chunks || []) {
+            if (chunk.state === 'waiting') {
+                chunk.state = 'pending';
+            }
+        }
+
+        this.emitProgress();
+
+        // Notify error callback
+        if (this.errorCallback) {
+            const callback = this.errorCallback;
+            TurboPush.safeCall(() => callback(error, entry.file.name, entry.progress.fileId));
+        }
+
+        this.checkSessionDone(session);
+    }
+
+    /**
+     * Sends the finalize request for a file and records the result
+     *
+     * @private
+     */
+    private async finalizeFile(session: Session, entry: FileEntry): Promise<void> {
+        entry.finalizing = true;
 
         try {
-            // Upload all chunks with progress tracking
-            await this.uploadChunksInParallel(fileId, chunks, (uploadedChunks) => {
-                // Calculate current progress
-                const uploadedSize = uploadedChunks * this.config.chunkSize;
-                progress.uploadedSize = Math.min(uploadedSize, file.size);
-                progress.percentage = (progress.uploadedSize / file.size) * 100;
-
-                // Calculate speed and remaining time (throttled to every 100ms)
-                const now = Date.now();
-                const timeDiff = (now - lastUpdate) / 1000;
-
-                if (timeDiff > 0.1) {
-                    const sizeDiff = progress.uploadedSize - lastUploadedSize;
-                    progress.speed = sizeDiff / timeDiff;
-                    progress.remainingTime = progress.speed > 0
-                        ? (file.size - progress.uploadedSize) / progress.speed
-                        : 0;
-                    lastUpdate = now;
-                    lastUploadedSize = progress.uploadedSize;
-                }
-
-                // Notify progress callback
-                if (this.progressCallback) {
-                    this.progressCallback(this.getProgress());
-                }
-            });
-
-            // Finalize the upload on server
-            await this.finalizeUpload(fileId, file);
+            const result = await this.finalizeWithRetries(session, entry);
+            if (session.cancelled) {
+                return;
+            }
 
             // Update final status
-            progress.status = 'completed';
-            progress.percentage = 100;
-            progress.uploadedSize = file.size;
+            entry.progress.status = 'completed';
+            entry.progress.percentage = 100;
+            entry.progress.uploadedSize = entry.file.size;
+            entry.progress.speed = 0;
+            entry.progress.remainingTime = 0;
+            entry.progress.result = result;
             this.stats.completedFiles++;
+            this.storageRemove(entry);
+
+            this.emitProgress();
 
             // Notify file complete callback
             if (this.fileCompleteCallback) {
-                this.fileCompleteCallback(file.name, fileId);
+                const callback = this.fileCompleteCallback;
+                TurboPush.safeCall(() => callback(entry.file.name, entry.progress.fileId, result));
             }
         } catch (error) {
-            // Handle upload failure
-            progress.status = 'failed';
-            progress.error = (error as Error).message;
-            this.stats.failedFiles++;
-
-            // Notify error callback
-            if (this.errorCallback) {
-                this.errorCallback(error as Error, file.name, fileId);
+            if (!session.cancelled) {
+                this.failFile(session, entry, TurboPush.toTurboPushError(error));
             }
-            throw error;
+        } finally {
+            entry.finalizing = false;
+            this.checkSessionDone(session);
         }
     }
 
     /**
-     * Uploads multiple chunks in parallel with automatic retry
-     * Manages concurrent upload limit and handles chunk failures
+     * Sends the finalize request, retrying temporary failures with backoff
+     * The server treats repeated finalize requests as one, so retrying is safe
      *
      * @private
-     * @param {string} fileId - Unique identifier for the file
-     * @param {ChunkInfo[]} chunks - Array of chunk metadata
-     * @param {Function} progressCallback - Callback for progress updates
-     * @returns {Promise<void>} Promise that resolves when all chunks uploaded
-     * @throws {Error} If chunks fail after all retries
+     * @returns {Promise<UploadResult>} The server's response data
      */
-    private async uploadChunksInParallel(
-        fileId: string,
-        chunks: ChunkInfo[],
-        progressCallback: (uploadedCount: number) => void
-    ): Promise<void> {
-        const pendingChunks = [...chunks.filter(chunk => !chunk.uploaded)];
-        let activeCount = 0;
-        let completedCount = chunks.filter(c => c.uploaded).length;
-        let currentIndex = 0;
-        let hasError = false;
-        let errorMessage = '';
-
-        return new Promise((resolve, reject) => {
-            const uploadNext = async () => {
-                // CRITICAL: Check for completion FIRST before checking errors
-                // This ensures the promise resolves/rejects even when errors occur
-                if (currentIndex >= pendingChunks.length && activeCount === 0) {
-                    if (completedCount === chunks.length) {
-                        resolve();
-                    } else {
-                        reject(new Error(errorMessage || 'Some chunks failed'));
-                    }
-                    return;
+    private async finalizeWithRetries(session: Session, entry: FileEntry): Promise<UploadResult> {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                return await this.finalizeUpload(entry);
+            } catch (error) {
+                const failure = TurboPush.toTurboPushError(error);
+                if (session.cancelled || !failure.retryable || attempt > this.config.maxRetries) {
+                    throw failure;
                 }
+                const delay = this.retryDelayFor(attempt);
+                this.emitRetry(entry, null, attempt, delay, failure);
+                await this.sleep(session, delay);
+            }
+        }
+    }
 
-                // Check if we should stop starting new uploads
-                if (this.isPaused || hasError) return;
-
-                // Start new uploads up to the concurrent limit
-                while (activeCount < this.config.maxConcurrentUploads &&
-                       currentIndex < pendingChunks.length &&
-                       !this.isPaused && !hasError) {
-
-                    const chunk = pendingChunks[currentIndex];
-                    currentIndex++;
-                    activeCount++;
-
-                    // Upload the chunk asynchronously
-                    this.uploadChunk(fileId, chunk)
-                        .then(() => {
-                            // Chunk uploaded successfully
-                            chunk.uploaded = true;
-                            completedCount++;
-                            this.stats.uploadedBytes += (chunk.end - chunk.start);
-                            progressCallback(completedCount);
-                        })
-                        .catch((error) => {
-                            // Chunk upload failed
-                            if (chunk.attempts < this.config.maxRetries) {
-                                // Retry the chunk
-                                chunk.attempts++;
-                                pendingChunks.push(chunk);
-                            } else {
-                                // Max retries exceeded
-                                hasError = true;
-                                errorMessage = `Failed chunk ${chunk.index}: ${error.message}`;
-                            }
-                        })
-                        .finally(() => {
-                            // Chunk attempt complete (success or failure)
-                            activeCount--;
-                            uploadNext();
-                        });
-                }
-            };
-
-            // Start the upload process
-            uploadNext();
+    /**
+     * Resolves the session once every file has completed or failed
+     *
+     * @private
+     */
+    private checkSessionDone(session: Session): void {
+        if (session.cancelled || this.session !== session) {
+            return;
+        }
+        const busy = session.fileIds.some(fileId => {
+            const entry = this.entries.get(fileId);
+            if (!entry) {
+                return false;
+            }
+            const status = entry.progress.status;
+            return entry.finalizing || (status !== 'completed' && status !== 'failed');
         });
+        if (!busy) {
+            this.session = null;
+            session.finish();
+        }
+    }
+
+    /**
+     * Asks the server which chunks of a restored upload it already has
+     * Starts the upload from scratch if the server has nothing usable
+     *
+     * @private
+     */
+    private async restoreFromServer(session: Session, fileId: string): Promise<void> {
+        const entry = this.entries.get(fileId);
+        if (!entry || !entry.restored || entry.started || !entry.chunks) {
+            return;
+        }
+
+        let data: Record<string, unknown>;
+        try {
+            const body = await this.request(fileId, `${fileId}:status`, 'status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...this.config.headers },
+                body: JSON.stringify({ action: 'status', fileId })
+            });
+            data = (body.data && typeof body.data === 'object' ? body.data : {}) as Record<string, unknown>;
+        } catch (error) {
+            // Unknown upload (or a server without the status action): start fresh
+            return;
+        }
+
+        if (session.cancelled || this.entries.get(fileId) !== entry) {
+            return;
+        }
+
+        if (data.complete === true && data.fileSize === entry.file.size) {
+            // Uploaded completely before the page was reloaded
+            for (const chunk of entry.chunks) {
+                if (chunk.state !== 'done') {
+                    chunk.state = 'done';
+                    this.addUploadedBytes(entry, chunk.end - chunk.start);
+                }
+            }
+            const { complete, ...result } = data;
+            entry.progress.status = 'completed';
+            entry.progress.percentage = 100;
+            entry.progress.result = result as UploadResult;
+            this.stats.completedFiles++;
+            this.storageRemove(entry);
+            this.emitProgress();
+            if (this.fileCompleteCallback) {
+                const callback = this.fileCompleteCallback;
+                TurboPush.safeCall(() => callback(entry.file.name, fileId, result as UploadResult));
+            }
+            return;
+        }
+
+        const uploaded = data.uploadedChunks;
+        if (data.complete === false
+            && data.fileSize === entry.file.size
+            && data.totalChunks === entry.chunks.length
+            && Array.isArray(uploaded)) {
+            for (const index of uploaded) {
+                const chunk = entry.chunks[index as number];
+                if (chunk && chunk.state !== 'done') {
+                    chunk.state = 'done';
+                    this.addUploadedBytes(entry, chunk.end - chunk.start);
+                }
+            }
+            entry.started = true;
+            this.emitProgress();
+            return;
+        }
+
+        // The server holds something incompatible (for example a different
+        // chunk size): drop it and start again
+        await this.sendAbort(fileId);
     }
 
     /**
      * Uploads a single chunk to the server
-     * Handles retry delay, timeout, and error handling
      *
      * @private
-     * @param {string} fileId - Unique identifier for the file
+     * @param {FileEntry} entry - The file
      * @param {ChunkInfo} chunk - Chunk metadata and data
      * @returns {Promise<void>} Promise that resolves when chunk uploads
-     * @throws {Error} If upload fails or times out
+     * @throws {TurboPushError|PausedSignal} If upload fails, times out or is paused
      */
-    private async uploadChunk(fileId: string, chunk: ChunkInfo): Promise<void> {
-        const file = this.files.get(fileId);
-        if (!file) throw new Error('TurboPush: File not found');
+    private async uploadChunk(entry: FileEntry, chunk: ChunkInfo): Promise<void> {
+        const fileId = entry.progress.fileId;
 
-        // Apply exponential backoff delay if this is a retry
-        if (chunk.attempts > 0) {
-            await this.sleep(this.config.retryDelay * chunk.attempts);
+        // Prepare form data with metadata first, then the chunk
+        const formData = new FormData();
+        formData.append('fileName', entry.file.name);
+        formData.append('fileId', fileId);
+        formData.append('chunkIndex', chunk.index.toString());
+        formData.append('totalChunks', entry.chunks!.length.toString());
+        formData.append('fileSize', entry.file.size.toString());
+        formData.append('file', chunk.blob);
+
+        // The browser sets the multipart Content-Type with its boundary
+        const headers: Record<string, string> = {};
+        for (const [name, value] of Object.entries(this.config.headers)) {
+            if (name.toLowerCase() !== 'content-type') {
+                headers[name] = value;
+            }
         }
 
-        // Create AbortController for timeout/cancellation
-        const controller = new AbortController();
-        const uploadKey = `${fileId}-${chunk.index}`;
-        this.activeUploads.set(uploadKey, controller);
-
-        try {
-            // Prepare form data with chunk and metadata
-            const formData = new FormData();
-            formData.append('file', chunk.blob);
-            formData.append('fileName', file.name);
-            formData.append('fileId', fileId);
-            formData.append('chunkIndex', chunk.index.toString());
-            formData.append('totalChunks', this.fileChunks.get(fileId)!.length.toString());
-            formData.append('fileSize', file.size.toString());
-
-            // Set up timeout
-            const timeoutId = setTimeout(() => controller.abort(), this.config.timeout);
-
-            // Upload the chunk
-            const response = await fetch(this.config.endpoint, {
-                method: 'POST',
-                body: formData,
-                headers: this.config.headers,
-                credentials: this.config.withCredentials ? 'include' : 'omit',
-                signal: controller.signal
-            });
-
-            clearTimeout(timeoutId);
-
-            // Check for HTTP errors
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-
-            // Parse and validate response
-            const result = await response.json();
-            if (!result.success) {
-                throw new Error(result.error || 'Upload failed');
-            }
-        } catch (error) {
-            // Handle timeout errors specifically
-            if ((error as Error).name === 'AbortError') {
-                throw new Error('Upload timeout');
-            }
-            throw error;
-        } finally {
-            // Clean up abort controller
-            this.activeUploads.delete(uploadKey);
-        }
+        await this.request(fileId, `${fileId}:${chunk.index}`, 'chunk', {
+            method: 'POST',
+            body: formData,
+            headers
+        }, chunk.index);
     }
 
     /**
@@ -915,13 +1455,13 @@ export class TurboPush {
      * Tells server to merge chunks into final file
      *
      * @private
-     * @param {string} fileId - Unique identifier for the file
-     * @param {File} file - The File object
-     * @returns {Promise<void>} Promise that resolves when finalization completes
-     * @throws {Error} If finalization fails
+     * @param {FileEntry} entry - The file
+     * @returns {Promise<UploadResult>} The server's response data
+     * @throws {TurboPushError} If finalization fails
      */
-    private async finalizeUpload(fileId: string, file: File): Promise<void> {
-        const response = await fetch(this.config.endpoint, {
+    private async finalizeUpload(entry: FileEntry): Promise<UploadResult> {
+        const fileId = entry.progress.fileId;
+        const body = await this.request(fileId, `${fileId}:finalize`, 'finalize', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -929,39 +1469,249 @@ export class TurboPush {
             },
             body: JSON.stringify({
                 action: 'finalize',
-                fileName: file.name,
-                fileId: fileId,
-                fileSize: file.size,
-                totalChunks: this.fileChunks.get(fileId)!.length
-            }),
-            credentials: this.config.withCredentials ? 'include' : 'omit'
-        });
+                fileName: entry.file.name,
+                fileId,
+                fileSize: entry.file.size,
+                totalChunks: entry.chunks!.length
+            })
+        }, undefined, 'Finalization failed');
 
-        if (!response.ok) {
-            throw new Error(`Finalization failed: ${response.statusText}`);
-        }
+        return (body.data && typeof body.data === 'object' && !Array.isArray(body.data)
+            ? body.data
+            : {}) as UploadResult;
+    }
 
-        const result = await response.json();
-        if (!result.success) {
-            throw new Error(result.error || 'Finalization failed');
+    /**
+     * Asks the server to delete an upload's chunks (best effort)
+     *
+     * @private
+     * @param {string} fileId - Upload ID
+     * @returns {Promise<void>} Resolves when the request has finished, successful or not
+     */
+    private async sendAbort(fileId: string): Promise<void> {
+        try {
+            await fetch(this.config.endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...this.config.headers },
+                body: JSON.stringify({ action: 'abort', fileId }),
+                credentials: this.config.withCredentials ? 'include' : 'omit',
+                keepalive: true
+            });
+        } catch (error) {
+            // Abandoned chunks are also removed by the server's cleanup
         }
     }
 
     /**
+     * Sends a request with a timeout and turns every failure into a TurboPushError
+     *
+     * @private
+     * @param {string} fileId - Upload ID the request belongs to
+     * @param {string} key - Unique key for the in-flight request
+     * @param {string} kind - Request kind
+     * @param {RequestInit} init - Fetch options
+     * @param {number} [chunkIndex] - Chunk index, for error details
+     * @param {string} [failureMessage] - Message when the server reports failure without one
+     * @returns {Promise<Record<string, any>>} The parsed JSON response
+     */
+    private async request(
+        fileId: string,
+        key: string,
+        kind: InFlightRequest['kind'],
+        init: RequestInit,
+        chunkIndex?: number,
+        failureMessage: string = 'Upload failed'
+    ): Promise<Record<string, any>> {
+        // Create AbortController for timeout/cancellation
+        const controller = new AbortController();
+        const record: InFlightRequest = { fileId, kind, controller };
+        this.inFlight.set(key, record);
+
+        // Set up timeout
+        const timeoutId = setTimeout(() => {
+            record.reason = 'timeout';
+            controller.abort();
+        }, this.config.timeout);
+
+        try {
+            let response: Response;
+            let body: unknown;
+            try {
+                response = await fetch(this.config.endpoint, {
+                    ...init,
+                    credentials: this.config.withCredentials ? 'include' : 'omit',
+                    signal: controller.signal
+                });
+                body = await TurboPush.readJson(response);
+            } catch (error) {
+                throw this.abortError(record, chunkIndex) || new TurboPushError(
+                    (error as Error)?.message || 'Network error',
+                    { code: 'network', retryable: true, chunkIndex, cause: error }
+                );
+            }
+
+            const aborted = this.abortError(record, chunkIndex);
+            if (aborted) {
+                throw aborted;
+            }
+
+            const result = (body && typeof body === 'object' ? body : null) as Record<string, any> | null;
+            const serverMessage = result && typeof (result.message ?? result.error) === 'string'
+                ? (result.message ?? result.error) as string
+                : null;
+
+            // Check for HTTP errors
+            if (!response.ok) {
+                const status = response.status;
+                throw new TurboPushError(
+                    serverMessage || `HTTP ${status}${response.statusText ? ': ' + response.statusText : ''}`,
+                    {
+                        code: 'http',
+                        status,
+                        retryable: status === 408 || status === 429 || status >= 500,
+                        chunkIndex,
+                        data: result ? result.data : undefined
+                    }
+                );
+            }
+
+            // Parse and validate response
+            if (!result) {
+                throw new TurboPushError('Invalid response from server', {
+                    code: 'invalid_response', status: response.status, retryable: true, chunkIndex
+                });
+            }
+            if (!result.success) {
+                throw new TurboPushError(serverMessage || failureMessage, {
+                    code: 'server', status: response.status, retryable: false, chunkIndex, data: result.data
+                });
+            }
+
+            return result;
+        } finally {
+            // Clean up timeout and abort controller
+            clearTimeout(timeoutId);
+            if (this.inFlight.get(key) === record) {
+                this.inFlight.delete(key);
+            }
+        }
+    }
+
+    /**
+     * Gets the error for a request that was aborted on purpose
+     *
+     * @private
+     * @returns {Error | null} The error to throw, or null if the request was not aborted
+     */
+    private abortError(record: InFlightRequest, chunkIndex?: number): Error | null {
+        switch (record.reason) {
+            case 'paused':
+                return new PausedSignal('Paused');
+            case 'timeout':
+                return new TurboPushError('Upload timeout', { code: 'timeout', retryable: true, chunkIndex });
+            case 'cancelled':
+            case 'failed':
+                return new TurboPushError('Upload cancelled', { code: 'cancelled', retryable: false, chunkIndex });
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Adds uploaded bytes to a file's progress and the session statistics
+     *
+     * @private
+     */
+    private addUploadedBytes(entry: FileEntry, bytes: number): void {
+        const progress = entry.progress;
+        progress.uploadedSize = Math.min(progress.uploadedSize + bytes, entry.file.size);
+        progress.percentage = entry.file.size > 0 ? (progress.uploadedSize / entry.file.size) * 100 : 0;
+        this.stats.uploadedBytes += bytes;
+    }
+
+    /**
+     * Updates a file's speed and remaining time (throttled to every 100ms)
+     *
+     * @private
+     */
+    private updateSpeed(entry: FileEntry): void {
+        const progress = entry.progress;
+        const now = Date.now();
+        const timeDiff = (now - entry.lastSpeedTime) / 1000;
+
+        if (timeDiff > 0.1) {
+            const sizeDiff = progress.uploadedSize - entry.lastSpeedBytes;
+            progress.speed = sizeDiff / timeDiff;
+            progress.remainingTime = progress.speed > 0
+                ? (entry.file.size - progress.uploadedSize) / progress.speed
+                : 0;
+            entry.lastSpeedTime = now;
+            entry.lastSpeedBytes = progress.uploadedSize;
+        }
+    }
+
+    /**
+     * Notifies the progress callback
+     *
+     * @private
+     */
+    private emitProgress(): void {
+        if (this.progressCallback) {
+            const callback = this.progressCallback;
+            TurboPush.safeCall(() => callback(this.getProgress()));
+        }
+    }
+
+    /**
+     * Notifies the retry callback
+     *
+     * @private
+     */
+    private emitRetry(entry: FileEntry, chunkIndex: number | null, attempt: number, delay: number, error: TurboPushError): void {
+        if (this.retryCallback) {
+            const callback = this.retryCallback;
+            TurboPush.safeCall(() => callback({
+                fileName: entry.file.name,
+                fileId: entry.progress.fileId,
+                chunkIndex,
+                attempt,
+                delay,
+                error
+            }));
+        }
+    }
+
+    /**
+     * Calculates the delay before a retry: exponential backoff with jitter
+     * The delay doubles with each attempt, up to maxRetryDelay, and a random
+     * part (50-100% of it) spreads out retries from many clients
+     *
+     * @private
+     * @param {number} attempt - Retry attempt, starting at 1
+     * @returns {number} Delay in milliseconds
+     */
+    private retryDelayFor(attempt: number): number {
+        const base = Math.min(this.config.maxRetryDelay, this.config.retryDelay * Math.pow(2, attempt - 1));
+        return Math.round(base / 2 + Math.random() * (base / 2));
+    }
+
+    /**
      * Splits a file into chunks for uploading
-     * Creates chunk metadata including blob slices
+     * Creates chunk metadata including blob slices. An empty file gets
+     * one empty chunk.
      *
      * @private
      * @param {File} file - File to split into chunks
+     * @param {number} chunkSize - Chunk size in bytes
      * @returns {ChunkInfo[]} Array of chunk metadata
      */
-    private createChunks(file: File): ChunkInfo[] {
+    private createChunks(file: File, chunkSize: number): ChunkInfo[] {
         const chunks: ChunkInfo[] = [];
-        const totalChunks = Math.ceil(file.size / this.config.chunkSize);
+        const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
 
         for (let i = 0; i < totalChunks; i++) {
-            const start = i * this.config.chunkSize;
-            const end = Math.min(start + this.config.chunkSize, file.size);
+            const start = i * chunkSize;
+            const end = Math.min(start + chunkSize, file.size);
 
             chunks.push({
                 index: i,
@@ -969,7 +1719,7 @@ export class TurboPush {
                 end,
                 blob: file.slice(start, end),
                 attempts: 0,
-                uploaded: false
+                state: 'pending'
             });
         }
         return chunks;
@@ -977,29 +1727,192 @@ export class TurboPush {
 
     /**
      * Generates a unique identifier for a file upload session
-     * Combines filename, size, timestamp, and random string
+     * Combines a shortened filename, size, timestamp and a random string,
+     * using only characters the server accepts
      *
      * @private
      * @param {File} file - File to generate ID for
      * @returns {string} Unique file identifier
      */
     private generateFileId(file: File): string {
-        const timestamp = Date.now();
-        const random = Math.random().toString(36).substring(2, 15);
-        return `${file.name.replace(/[^a-zA-Z0-9]/g, '_')}-${file.size}-${timestamp}-${random}`;
+        const name = file.name.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 64);
+        let random = '';
+        const cryptoApi = typeof globalThis !== 'undefined' ? (globalThis as any).crypto : undefined;
+        if (cryptoApi && typeof cryptoApi.getRandomValues === 'function') {
+            const bytes = cryptoApi.getRandomValues(new Uint8Array(8)) as Uint8Array;
+            random = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+        } else {
+            random = Math.random().toString(36).substring(2, 15);
+        }
+        return `${name}-${file.size}-${Date.now()}-${random}`;
     }
 
     /**
-     * Promise-based sleep utility for delays
+     * Promise-based sleep that ends early when the session is cancelled
      *
      * @private
+     * @param {Session} session - The session
      * @param {number} ms - Milliseconds to sleep
      * @returns {Promise<void>} Promise that resolves after delay
      */
-    private sleep(ms: number): Promise<void> {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    private sleep(session: Session, ms: number): Promise<void> {
+        return new Promise(resolve => {
+            const timer = setTimeout(() => {
+                session.timers.delete(timer);
+                resolve();
+            }, ms);
+            session.timers.add(timer);
+            if (session.cancelled) {
+                clearTimeout(timer);
+                resolve();
+            }
+        });
+    }
+
+    /**
+     * Gets the storage key for a file in resumable mode
+     *
+     * @private
+     */
+    private storageKey(file: File): string {
+        return `turbopush:${this.config.endpoint}:${file.name}:${file.size}:${file.lastModified || 0}`;
+    }
+
+    /**
+     * Reads a value from localStorage, if available
+     *
+     * @private
+     */
+    private storageGet(key: string): string | null {
+        try {
+            return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    /**
+     * Writes a value to localStorage, if available
+     *
+     * @private
+     */
+    private storageSet(key: string, value: string): void {
+        try {
+            if (typeof localStorage !== 'undefined') {
+                localStorage.setItem(key, value);
+            }
+        } catch (error) {
+            // Storage full or disabled: resuming after reload just won't work
+        }
+    }
+
+    /**
+     * Forgets a file's upload ID in resumable mode
+     *
+     * @private
+     */
+    private storageRemove(entry: FileEntry): void {
+        if (!this.config.resumable) {
+            return;
+        }
+        const key = this.storageKey(entry.file);
+        try {
+            if (typeof localStorage !== 'undefined' && localStorage.getItem(key) === entry.progress.fileId) {
+                localStorage.removeItem(key);
+            }
+        } catch (error) {
+            // Ignore storage errors
+        }
+    }
+
+    /**
+     * Calls a user callback without letting its exceptions break the upload
+     * The exception is rethrown asynchronously so it still shows up in the console
+     *
+     * @private
+     */
+    private static safeCall(callback: () => void): void {
+        try {
+            callback();
+        } catch (error) {
+            setTimeout(() => { throw error; }, 0);
+        }
+    }
+
+    /**
+     * Reads a JSON response body, returning undefined if it is not JSON
+     *
+     * @private
+     */
+    private static async readJson(response: Response): Promise<unknown> {
+        if (!response || typeof response.json !== 'function') {
+            return undefined;
+        }
+        try {
+            return await response.json();
+        } catch (error) {
+            return undefined;
+        }
+    }
+
+    /**
+     * Wraps any error in a TurboPushError
+     *
+     * @private
+     */
+    private static toTurboPushError(error: unknown, chunkIndex?: number): TurboPushError {
+        if (error instanceof TurboPushError) {
+            return error;
+        }
+        return new TurboPushError((error as Error)?.message || String(error), {
+            code: 'network', retryable: true, chunkIndex, cause: error
+        });
+    }
+
+    /**
+     * Returns a finite number, or the fallback
+     *
+     * @private
+     */
+    private static number(value: unknown, fallback: number): number {
+        return typeof value === 'number' && isFinite(value) ? value : fallback;
+    }
+
+    /**
+     * Returns a positive finite number, or the fallback
+     *
+     * @private
+     */
+    private static positive(value: unknown, fallback: number): number {
+        const result = TurboPush.number(value, fallback);
+        return result > 0 ? result : fallback;
+    }
+
+    /**
+     * Creates zeroed statistics
+     *
+     * @private
+     */
+    private static emptyStats(): UploadStats {
+        return {
+            totalFiles: 0,
+            completedFiles: 0,
+            failedFiles: 0,
+            totalBytes: 0,
+            uploadedBytes: 0,
+            startTime: Date.now()
+        };
     }
 }
 
 // Export type definitions for external use
-export type { TurboPushConfig, UploadProgress, UploadStats };
+export type {
+    TurboPushConfig,
+    UploadProgress,
+    UploadStats,
+    UploadStatus,
+    UploadResult,
+    RetryInfo,
+    TurboPushErrorCode,
+    TurboPushErrorOptions
+};
