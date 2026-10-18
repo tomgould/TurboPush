@@ -544,7 +544,7 @@ class TurboPushEndpoint
             if (is_array($json) && isset($json['action'])) {
                 // Requiring the JSON content type means browsers must send a CORS
                 // preflight for cross-site actions, which blocks simple CSRF
-                if (!isset($server['CONTENT_TYPE']) || stripos($server['CONTENT_TYPE'], 'application/json') !== 0) {
+                if (!$this->isJson($server)) {
                     throw new TurboPushException('Content-Type must be application/json', 415);
                 }
                 return $this->handleAction($json);
@@ -579,7 +579,10 @@ class TurboPushEndpoint
      * @private
      */
     private function handleAction(array $data) {
-        switch ($data['action']) {
+        // switch compares loosely, so a non-string such as true (or 0 on
+        // PHP 7) would otherwise match 'finalize'
+        $action = is_string($data['action']) ? $data['action'] : '';
+        switch ($action) {
             case 'finalize':
                 return $this->finalizeUpload($data);
             case 'status':
@@ -1721,6 +1724,25 @@ class TurboPushEndpoint
                 $bytes *= 1024;
         }
         return $bytes;
+    }
+
+    /**
+     * Checks whether the request's media type is exactly application/json
+     *
+     * Parameters such as charset are allowed; application/jsonx or
+     * application/json-patch+json are not.
+     *
+     * @param array $server Server parameters
+     * @return bool
+     *
+     * @private
+     */
+    private function isJson(array $server) {
+        if (!isset($server['CONTENT_TYPE'])) {
+            return false;
+        }
+        $parts = explode(';', (string) $server['CONTENT_TYPE'], 2);
+        return strtolower(trim($parts[0])) === 'application/json';
     }
 
     /**

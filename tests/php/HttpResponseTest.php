@@ -51,14 +51,14 @@ class HttpResponseTest extends EndpointTestCase
         $body = json_encode(['action' => 'abort', 'fileId' => 'csrf']);
 
         // A cross-site form or fetch can send text/plain without a preflight
-        foreach (['text/plain', 'application/x-www-form-urlencoded', null] as $type) {
+        foreach (['text/plain', 'application/x-www-form-urlencoded', 'application/jsonx', 'application/json-patch+json', null] as $type) {
             $server = ['REQUEST_METHOD' => 'POST'] + ($type ? ['CONTENT_TYPE' => $type] : []);
             $response = $endpoint->processRequest($server, [], [], $body);
             $this->assertSame(415, $response['status'], (string) $type);
         }
         $this->assertDirectoryExists($this->tempDir . 'csrf');
 
-        $response = $endpoint->processRequest(['REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'application/json; charset=utf-8'], [], [], $body);
+        $response = $endpoint->processRequest(['REQUEST_METHOD' => 'POST', 'CONTENT_TYPE' => 'Application/JSON ; charset=utf-8'], [], [], $body);
         $this->assertSame(200, $response['status']);
     }
 
