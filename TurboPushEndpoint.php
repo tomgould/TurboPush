@@ -22,6 +22,7 @@
  * @license MIT
  */
 
+require_once __DIR__ . '/php/TurboPushException.php';
 require_once __DIR__ . '/php/TurboPushEndpoint.php';
 
 if (!class_exists('TurboPushEndpoint', false)) {

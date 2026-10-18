@@ -95,6 +95,17 @@ class HttpResponseTest extends EndpointTestCase
         $this->assertInstanceOf(\RuntimeException::class, $e);
     }
 
+    public function testLegacyEntryPointWorksWithoutComposer(): void {
+        $script = 'require ' . var_export(dirname(__DIR__, 2) . '/TurboPushEndpoint.php', true) . ';'
+            . '$e = new TurboPushEndpoint(' . var_export($this->uploadDir, true) . ', ' . var_export($this->tempDir, true) . ');'
+            . '$r = $e->processRequest(["REQUEST_METHOD" => "GET"], [], [], "");'
+            . 'echo $r["status"], " ", $r["body"]["message"];';
+
+        $output = shell_exec(escapeshellarg(PHP_BINARY) . ' -n -r ' . escapeshellarg($script) . ' 2>&1');
+
+        $this->assertSame('405 Method not allowed', $output);
+    }
+
     public function testLegacyGlobalClassNameStillWorks(): void {
         require_once __DIR__ . '/../../TurboPushEndpoint.php';
 
