@@ -62,3 +62,30 @@ jobs:
 
       - name: PHPUnit
         run: vendor/bin/phpunit
+
+  interop:
+    name: tus interop (tusd, tus-php)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Start tus servers
+        run: docker compose -f tests/interop/docker-compose.yml up -d --build --wait
+
+      - name: Interop tests
+        run: npm run test:interop
+
+      - name: Server logs
+        if: failure()
+        run: docker compose -f tests/interop/docker-compose.yml logs
+
+      - name: Stop tus servers
+        if: always()
+        run: docker compose -f tests/interop/docker-compose.yml down -v

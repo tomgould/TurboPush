@@ -1,0 +1,24 @@
+# Real tus servers for the interop tests (npm run interop)
+#
+#   tusd           http://localhost:1080/files/  tusd, the reference server, with concatenation
+#   tusd-noconcat  http://localhost:1081/files/  tusd started with -disable-concatenation
+#   tus-php        http://localhost:1082/files/  tus-php (ankitpokhrel/tus-php) on PHP's built-in server
+name: turbopush-interop
+
+services:
+  tusd:
+    image: tusproject/tusd:v2.10.1
+    command: ["-base-path", "/files/", "-port", "8080"]
+    ports:
+      - "1080:8080"
+
+  tusd-noconcat:
+    image: tusproject/tusd:v2.10.1
+    command: ["-base-path", "/files/", "-port", "8080", "-disable-concatenation"]
+    ports:
+      - "1081:8080"
+
+  tus-php:
+    build: ./tus-php
+    ports:
+      - "1082:8000"

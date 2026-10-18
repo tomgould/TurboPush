@@ -3,6 +3,8 @@ module.exports = {
     testEnvironment: 'jsdom',
     roots: ['<rootDir>/tests'],
     testMatch: ['**/*.test.ts'],
+    // Interop tests need real servers: npm run interop
+    testPathIgnorePatterns: ['/node_modules/', '<rootDir>/tests/interop/'],
     setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
     collectCoverageFrom: [
         'TurboPush.ts',

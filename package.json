@@ -57,6 +57,8 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:php": "vendor/bin/phpunit",
+    "test:interop": "jest -c jest.interop.config.js",
+    "interop": "node scripts/interop.js",
     "demo": "npm run build && php -S localhost:8000",
     "prepare": "npm run build"
   },
