@@ -1,8 +1,10 @@
 /**
  * MockServer - HTTP Mock Server for Testing
  *
- * Simulates a TurboPush upload endpoint for testing without actual HTTP requests.
- * Supports chunk uploads, finalization, and failure simulation.
+ * Simulates a TurboPush upload endpoint by replacing global fetch. It stores
+ * chunks, reassembles them on finalize, implements the status and abort
+ * actions, honours abort signals and records how many chunk requests were
+ * in flight at once.
  *
  * @example
  * ```typescript
@@ -11,6 +13,9 @@
  *
  * // Simulate 2 failures before success
  * mockServer.simulateIntermittentFailures(2);
+ *
+ * // Answer chunk 3 with a 503 once
+ * mockServer.intercept(req => req.chunkIndex === 3 ? MockServer.json(503, { success: false }) : undefined, 1);
  *
  * // Run tests...
  *
@@ -22,9 +27,9 @@
  */
 
 /**
- * Mock HTTP response object matching the fetch API Response interface
+ * Mock HTTP response object matching the parts of the fetch Response the client uses
  */
-interface MockResponse {
+export interface MockResponse {
     ok: boolean;
     status: number;
     statusText: string;
@@ -34,25 +39,43 @@ interface MockResponse {
 /**
  * Request capture object containing URL and options
  */
-interface CapturedRequest {
+export interface CapturedRequest {
     url: string;
     options?: RequestInit;
 }
 
 /**
- * Finalization request data
+ * Parsed view of a request, passed to interceptors
  */
-interface FinalizeData {
-    action: string;
+export interface MockRequest {
+    kind: 'chunk' | 'finalize' | 'status' | 'abort' | 'unknown';
+    url: string;
+    options?: RequestInit;
+    fileId?: string;
+    chunkIndex?: number;
+    fields?: Record<string, FormDataEntryValue>;
+    json?: any;
+}
+
+/**
+ * An upload as stored by the mock server
+ */
+export interface StoredUpload {
     fileName: string;
-    fileId: string;
     fileSize: number;
     totalChunks: number;
+    chunks: Map<number, Blob>;
+    result?: { fileName: string; fileSize: number };
 }
+
+type Interceptor = (request: MockRequest) => MockResponse | Promise<MockResponse> | undefined;
 
 export class MockServer {
     /** Array of all captured HTTP requests made to the mock server */
     private requests: CapturedRequest[] = [];
+
+    /** Parsed requests, in order */
+    private parsed: MockRequest[] = [];
 
     /** Current count of failures that have been simulated */
     private failureCount: number = 0;
@@ -62,6 +85,21 @@ export class MockServer {
 
     /** Mock endpoint URL returned to clients */
     private endpoint: string = '/mock-upload';
+
+    /** Simulated network latency in milliseconds */
+    private latency: number = 10;
+
+    /** Interceptors with their remaining use count (Infinity = permanent) */
+    private interceptors: { handler: Interceptor; remaining: number }[] = [];
+
+    /** Uploads by fileId */
+    private uploads: Map<string, StoredUpload> = new Map();
+
+    /** Chunk requests currently being handled */
+    private inFlight: number = 0;
+
+    /** Highest number of chunk requests handled at once */
+    private maxInFlight: number = 0;
 
     /** Reference to the original global fetch function */
     private originalFetch: typeof global.fetch;
@@ -75,11 +113,19 @@ export class MockServer {
     }
 
     /**
+     * Builds a JSON response
+     */
+    public static json(status: number, body: any): MockResponse {
+        return {
+            ok: status >= 200 && status < 300,
+            status,
+            statusText: status === 200 ? 'OK' : 'Error',
+            json: async () => body
+        };
+    }
+
+    /**
      * Starts the mock server by replacing global.fetch with the mock implementation
-     * All fetch calls will be intercepted and handled by this mock server
-     *
-     * @public
-     * @returns {void}
      */
     public start(): void {
         global.fetch = this.mockFetch.bind(this) as any;
@@ -87,22 +133,18 @@ export class MockServer {
 
     /**
      * Stops the mock server and restores the original fetch function
-     * Clears all captured requests and resets failure counters
-     *
-     * @public
-     * @returns {void}
      */
     public stop(): void {
         global.fetch = this.originalFetch;
         this.requests = [];
+        this.parsed = [];
         this.failureCount = 0;
+        this.interceptors = [];
+        this.uploads.clear();
     }
 
     /**
      * Gets the mock endpoint URL that clients should use for uploads
-     *
-     * @public
-     * @returns {string} The mock endpoint URL
      */
     public getEndpoint(): string {
         return this.endpoint;
@@ -110,28 +152,21 @@ export class MockServer {
 
     /**
      * Retrieves all HTTP requests that have been captured by the mock server
-     * Useful for verifying that the correct requests were made during testing
-     *
-     * @public
-     * @returns {CapturedRequest[]} Array of captured requests with URL and options
      */
     public getRequests(): CapturedRequest[] {
         return this.requests;
     }
 
     /**
+     * Retrieves parsed requests, optionally only of one kind
+     */
+    public getParsedRequests(kind?: MockRequest['kind']): MockRequest[] {
+        return kind ? this.parsed.filter(request => request.kind === kind) : this.parsed;
+    }
+
+    /**
      * Configures the mock server to simulate intermittent failures
-     * The first 'count' requests will fail with an error, then subsequent requests succeed
-     *
-     * @public
-     * @param {number} count - Number of requests that should fail before allowing success
-     * @returns {void}
-     *
-     * @example
-     * ```typescript
-     * mockServer.simulateIntermittentFailures(3);
-     * // First 3 requests will fail, then succeed
-     * ```
+     * The first 'count' requests will fail with a network error, then subsequent requests succeed
      */
     public simulateIntermittentFailures(count: number): void {
         this.maxFailures = count;
@@ -139,21 +174,71 @@ export class MockServer {
     }
 
     /**
-     * Mock fetch implementation that handles all intercepted requests
-     * Simulates chunk uploads and finalization requests
+     * Sets the simulated latency of every request
+     */
+    public setLatency(ms: number): void {
+        this.latency = ms;
+    }
+
+    /**
+     * Adds an interceptor. Return a response to answer the request yourself,
+     * or undefined to let the server handle it. Throwing simulates a network error.
      *
-     * @private
-     * @param {string | URL | Request} url - Request URL
-     * @param {RequestInit} [options] - Fetch options including method, body, headers
-     * @returns {Promise<MockResponse>} Promise resolving to mock response
-     * @throws {Error} When simulating failures
+     * @param handler - The interceptor
+     * @param times - How many requests it may answer (default: unlimited)
+     */
+    public intercept(handler: Interceptor, times: number = Infinity): void {
+        this.interceptors.push({ handler, remaining: times });
+    }
+
+    /**
+     * Gets a stored upload
+     */
+    public getUpload(fileId: string): StoredUpload | undefined {
+        return this.uploads.get(fileId);
+    }
+
+    /**
+     * Stores chunks directly, as if an earlier session had uploaded them
+     */
+    public seedUpload(fileId: string, upload: StoredUpload): void {
+        this.uploads.set(fileId, upload);
+    }
+
+    /**
+     * Highest number of chunk requests that were in flight at once
+     */
+    public getMaxConcurrentChunks(): number {
+        return this.maxInFlight;
+    }
+
+    /**
+     * Reads the stored chunks of an upload, in order, as one string
+     */
+    public async readAssembled(fileId: string): Promise<string> {
+        const upload = this.uploads.get(fileId);
+        if (!upload) {
+            throw new Error(`No upload ${fileId}`);
+        }
+        let text = '';
+        for (let i = 0; i < upload.totalChunks; i++) {
+            const chunk = upload.chunks.get(i);
+            if (!chunk) {
+                throw new Error(`Missing chunk ${i}`);
+            }
+            text += await MockServer.readBlob(chunk);
+        }
+        return text;
+    }
+
+    /**
+     * Mock fetch implementation that handles all intercepted requests
      */
     private async mockFetch(url: string | URL | Request, options?: RequestInit): Promise<MockResponse> {
         // Capture the request for inspection
-        this.requests.push({
-            url: url.toString(),
-            options
-        });
+        this.requests.push({ url: url.toString(), options });
+        const request = this.parse(url.toString(), options);
+        this.parsed.push(request);
 
         // Simulate failure if within failure threshold
         if (this.failureCount < this.maxFailures) {
@@ -161,58 +246,196 @@ export class MockServer {
             return Promise.reject(new Error('Simulated failure'));
         }
 
-        // Small delay to simulate network latency
-        await new Promise(resolve => setTimeout(resolve, 10));
+        const isChunk = request.kind === 'chunk';
+        if (isChunk) {
+            this.inFlight++;
+            this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+        }
 
-        // Check if this is a finalization request (JSON body with action: 'finalize')
-        if (options?.body && typeof options.body === 'string') {
+        try {
+            // Delay to simulate network latency
+            await this.wait(this.latency, options?.signal);
+
+            for (const interceptor of this.interceptors) {
+                if (interceptor.remaining <= 0) {
+                    continue;
+                }
+                const response = await interceptor.handler(request);
+                if (response) {
+                    interceptor.remaining--;
+                    return response;
+                }
+            }
+
+            switch (request.kind) {
+                case 'chunk':
+                    return this.handleChunk(request);
+                case 'finalize':
+                    return this.handleFinalize(request);
+                case 'status':
+                    return this.handleStatus(request);
+                case 'abort':
+                    this.uploads.delete(request.fileId!);
+                    return MockServer.json(200, { success: true, message: 'Upload aborted', data: [] });
+                default:
+                    return MockServer.json(400, { success: false, message: 'Unknown request', data: [] });
+            }
+        } finally {
+            if (isChunk) {
+                this.inFlight--;
+            }
+        }
+    }
+
+    /**
+     * Works out what kind of request this is
+     */
+    private parse(url: string, options?: RequestInit): MockRequest {
+        const body = options?.body;
+
+        if (body instanceof FormData) {
+            const fields: Record<string, FormDataEntryValue> = {};
+            body.forEach((value, key) => { fields[key] = value; });
+            return {
+                kind: 'chunk',
+                url,
+                options,
+                fields,
+                fileId: String(fields.fileId),
+                chunkIndex: Number(fields.chunkIndex)
+            };
+        }
+
+        if (typeof body === 'string') {
             try {
-                const json = JSON.parse(options.body);
-                if (json.action === 'finalize') {
-                    return this.handleFinalize(json);
+                const json = JSON.parse(body);
+                if (['finalize', 'status', 'abort'].includes(json.action)) {
+                    return { kind: json.action, url, options, json, fileId: json.fileId };
                 }
             } catch (error) {
-                // Not JSON or parse error, treat as chunk upload
+                // Not JSON
             }
         }
 
-        // Default to handling as chunk upload
-        return this.handleChunk();
+        return { kind: 'unknown', url, options };
     }
 
     /**
-     * Handles chunk upload requests
-     * Returns a successful response indicating the chunk was received
-     *
-     * @private
-     * @returns {MockResponse} Success response for chunk upload
+     * Stores a chunk
      */
-    private handleChunk(): MockResponse {
-        return {
-            ok: true,
-            status: 200,
-            statusText: 'OK',
-            json: async () => ({ success: true })
-        };
+    private handleChunk(request: MockRequest): MockResponse {
+        const fields = request.fields!;
+        const fileId = request.fileId!;
+        let upload = this.uploads.get(fileId);
+        if (!upload) {
+            upload = {
+                fileName: String(fields.fileName),
+                fileSize: Number(fields.fileSize),
+                totalChunks: Number(fields.totalChunks),
+                chunks: new Map()
+            };
+            this.uploads.set(fileId, upload);
+        }
+        if (upload.totalChunks !== Number(fields.totalChunks) || upload.fileSize !== Number(fields.fileSize)) {
+            return MockServer.json(409, { success: false, message: 'Upload metadata does not match', data: [] });
+        }
+        upload.chunks.set(request.chunkIndex!, fields.file as Blob);
+        return MockServer.json(200, {
+            success: true,
+            message: 'Chunk uploaded',
+            data: { chunkIndex: request.chunkIndex, totalChunks: upload.totalChunks }
+        });
     }
 
     /**
-     * Handles finalization requests after all chunks are uploaded
-     * Returns success response with the uploaded file information
-     *
-     * @private
-     * @param {FinalizeData} data - Finalization request data containing file metadata
-     * @returns {MockResponse} Success response with file information
+     * Checks that every chunk arrived and the sizes add up
      */
-    private handleFinalize(data: FinalizeData): MockResponse {
-        return {
-            ok: true,
-            status: 200,
-            statusText: 'OK',
-            json: async () => ({
-                success: true,
-                data: { fileName: data.fileName }
-            })
-        };
+    private handleFinalize(request: MockRequest): MockResponse {
+        const data = request.json;
+        const upload = this.uploads.get(data.fileId);
+        if (!upload) {
+            return MockServer.json(404, { success: false, message: 'Upload not found', data: [] });
+        }
+        if (upload.result) {
+            return MockServer.json(200, { success: true, message: 'Upload complete', data: upload.result });
+        }
+
+        const missing: number[] = [];
+        let size = 0;
+        for (let i = 0; i < data.totalChunks; i++) {
+            const chunk = upload.chunks.get(i);
+            if (!chunk) {
+                missing.push(i);
+            } else {
+                size += chunk.size;
+            }
+        }
+        if (missing.length > 0) {
+            return MockServer.json(409, { success: false, message: 'Missing chunks', data: { missingChunks: missing } });
+        }
+        if (size !== data.fileSize) {
+            return MockServer.json(409, { success: false, message: 'File size mismatch', data: [] });
+        }
+
+        upload.result = { fileName: data.fileName, fileSize: size };
+        return MockServer.json(200, { success: true, message: 'Upload complete', data: upload.result });
+    }
+
+    /**
+     * Reports which chunks are stored
+     */
+    private handleStatus(request: MockRequest): MockResponse {
+        const upload = this.uploads.get(request.fileId!);
+        if (!upload) {
+            return MockServer.json(404, { success: false, message: 'Upload not found', data: [] });
+        }
+        if (upload.result) {
+            return MockServer.json(200, { success: true, message: 'Upload complete', data: { complete: true, ...upload.result } });
+        }
+        return MockServer.json(200, {
+            success: true,
+            message: 'Upload in progress',
+            data: {
+                complete: false,
+                fileName: upload.fileName,
+                fileSize: upload.fileSize,
+                totalChunks: upload.totalChunks,
+                uploadedChunks: Array.from(upload.chunks.keys()).sort((a, b) => a - b)
+            }
+        });
+    }
+
+    /**
+     * Waits, rejecting with an AbortError if the signal fires first
+     */
+    private wait(ms: number, signal?: AbortSignal | null): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const abortError = () => {
+                const error = new Error('The operation was aborted.');
+                error.name = 'AbortError';
+                return error;
+            };
+            if (signal?.aborted) {
+                reject(abortError());
+                return;
+            }
+            const timer = setTimeout(resolve, ms);
+            signal?.addEventListener('abort', () => {
+                clearTimeout(timer);
+                reject(abortError());
+            }, { once: true });
+        });
+    }
+
+    /**
+     * Reads a Blob as text (jsdom's Blob has no text() method)
+     */
+    private static readBlob(blob: Blob): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsText(blob);
+        });
     }
 }
