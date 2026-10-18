@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [2.1.0] - Unreleased
+## [2.1.0] - 2026-10-18
 
 The client now speaks tus 1.0.0 as well as TurboPush's own protocol, so it
 works with tusd, tus-node-server, tus-php and the other tus servers. The
