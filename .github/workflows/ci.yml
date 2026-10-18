@@ -58,10 +58,17 @@ jobs:
         run: composer install --no-progress --no-interaction
 
       - name: PHP lint
-        run: find php tests/php examples demo TurboPushEndpoint.php -name '*.php' -print0 | xargs -0 -n1 php -l
+        run: find php tests/php examples demo conformance TurboPushEndpoint.php -name '*.php' -print0 | xargs -0 -n1 php -l
 
       - name: PHPUnit
         run: vendor/bin/phpunit
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Conformance suite against the endpoint
+        run: node conformance/php.mjs
 
   interop:
     name: tus interop (tusd, tus-php)

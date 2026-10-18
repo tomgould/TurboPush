@@ -1,5 +1,6 @@
 # Keep the Composer (Packagist) download to the PHP library
 /.github export-ignore
+/conformance export-ignore
 /demo export-ignore
 /scripts export-ignore
 /tests export-ignore

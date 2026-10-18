@@ -44,7 +44,8 @@
   "files": [
     "dist",
     "TurboPush.ts",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "PROTOCOL.md"
   ],
   "engines": {
     "node": ">=18"
@@ -59,6 +60,8 @@
     "test:php": "vendor/bin/phpunit",
     "test:interop": "jest -c jest.interop.config.js",
     "interop": "node scripts/interop.js",
+    "conformance": "node conformance/run.mjs",
+    "conformance:php": "node conformance/php.mjs",
     "demo": "npm run build && php -S localhost:8000",
     "prepare": "npm run build"
   },
