@@ -2,8 +2,6 @@
 
 namespace TurboPush;
 
-use Exception;
-
 /**
  * TurboPush Server Endpoint
  *
@@ -11,27 +9,29 @@ use Exception;
  * Receives file chunks, stores them temporarily, and merges them into final files.
  *
  * Features:
- * - Chunked upload handling
- * - Automatic file merging
- * - Size validation
- * - Extension filtering
+ * - Chunked upload handling with per-upload locking
+ * - Atomic chunk writes and atomic file assembly
+ * - Strict validation of upload IDs, chunk indexes, counts and sizes
+ * - Filename sanitisation, extension allowlist and a default blocklist
+ *   of server-executable extensions
+ * - Temporary chunks kept outside the web root by default
  * - CORS support
  * - Optional logging
  *
  * @package    TurboPush
- * @version    1.0.0
+ * @version    1.1.0
  * @license    MIT
  * @author     TomGould
  *
  * @example
  * ```php
- * require_once 'TurboPushEndpoint.php';
+ * use TurboPush\TurboPushEndpoint;
  *
- * $turbopush = new TurboPushEndpoint('./uploads/', './uploads/temp/');
+ * $turbopush = new TurboPushEndpoint('/var/www/uploads/');
  * $turbopush
  *     ->setMaxFileSize(10 * 1024 * 1024 * 1024)  // 10GB
  *     ->setAllowedExtensions(['jpg', 'png', 'pdf'])
- *     ->enableLogging('./uploads/turbopush.log')
+ *     ->enableLogging('/var/log/turbopush.log')
  *     ->handle();
  * ```
  */
@@ -48,6 +48,32 @@ use Exception;
 class TurboPushEndpoint
 {
     /**
+     * Upload IDs may only contain letters, digits, dashes and underscores,
+     * so they can never point outside the temporary directory.
+     */
+    const UPLOAD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,200}$/';
+
+    /**
+     * Maximum size of a JSON request body (finalize requests) in bytes
+     */
+    const MAX_JSON_BODY = 65536;
+
+    /**
+     * Name of the metadata file kept in each upload's temporary directory
+     */
+    const META_FILE = 'upload.json';
+
+    /**
+     * Name of the marker file written once an upload has been assembled
+     */
+    const DONE_FILE = 'complete.json';
+
+    /**
+     * Name of the lock file used to serialise work on one upload
+     */
+    const LOCK_FILE = '.lock';
+
+    /**
      * Directory where final merged files are stored
      * @var string
      */
@@ -57,7 +83,7 @@ class TurboPushEndpoint
      * Directory where temporary chunk files are stored during upload
      * @var string
      */
-    private $tempDir = './uploads/temp/';
+    private $tempDir;
 
     /**
      * Maximum allowed file size in bytes (default: 5GB)
@@ -66,10 +92,33 @@ class TurboPushEndpoint
     private $maxFileSize = 5368709120; // 5GB
 
     /**
+     * Maximum allowed size of a single chunk in bytes (default: 100MB)
+     * @var int
+     */
+    private $maxChunkSize = 104857600; // 100MB
+
+    /**
+     * Maximum number of chunks a single upload may be split into (default: 100000)
+     * @var int
+     */
+    private $maxChunks = 100000;
+
+    /**
      * Array of allowed file extensions (empty array = all extensions allowed)
      * @var array
      */
     private $allowedExtensions = [];
+
+    /**
+     * Extensions that are always rejected because a web server may execute them.
+     * Applied even when no allowlist is set. Override with setBlockedExtensions().
+     * @var array
+     */
+    private $blockedExtensions = [
+        'php', 'php3', 'php4', 'php5', 'php7', 'php8', 'phtml', 'pht', 'phar', 'phps',
+        'cgi', 'pl', 'asp', 'aspx', 'ashx', 'asmx', 'jsp', 'jspx', 'shtml', 'shtm',
+        'htaccess', 'htpasswd',
+    ];
 
     /**
      * Path to log file (null = logging disabled)
@@ -80,26 +129,22 @@ class TurboPushEndpoint
     /**
      * Constructs a new TurboPushEndpoint instance
      *
-     * Initializes upload and temporary directories, creating them if they don't exist.
+     * Directories are created on first use, not here, so a misconfigured
+     * path is reported through the normal error response.
      *
-     * @param string $uploadDir Directory for final uploaded files (default: './uploads/')
-     * @param string $tempDir   Directory for temporary chunk storage (default: './uploads/temp/')
-     *
-     * @throws Exception If directories cannot be created
+     * @param string      $uploadDir Directory for final uploaded files (default: './uploads/')
+     * @param string|null $tempDir   Directory for temporary chunk storage. Defaults to a
+     *                               folder under sys_get_temp_dir(), outside the web root.
      *
      * @example
      * ```php
-     * $endpoint = new TurboPushEndpoint('./my-uploads/', './my-uploads/temp/');
+     * $endpoint = new TurboPushEndpoint('/var/www/uploads/', '/var/tmp/turbopush/');
      * ```
      */
-    public function __construct($uploadDir = './uploads/', $tempDir = './uploads/temp/') {
+    public function __construct($uploadDir = './uploads/', $tempDir = null) {
         // Normalize directory paths with trailing slashes
-        $this->uploadDir = rtrim($uploadDir, '/') . '/';
-        $this->tempDir = rtrim($tempDir, '/') . '/';
-
-        // Ensure directories exist
-        $this->ensureDirectory($this->uploadDir);
-        $this->ensureDirectory($this->tempDir);
+        $this->uploadDir = rtrim($uploadDir, '/\\') . '/';
+        $this->tempDir = rtrim($tempDir !== null ? $tempDir : $this->defaultTempDir(), '/\\') . '/';
     }
 
     /**
@@ -116,7 +161,39 @@ class TurboPushEndpoint
      * ```
      */
     public function setMaxFileSize($bytes) {
-        $this->maxFileSize = $bytes;
+        $this->maxFileSize = max(0, (int) $bytes);
+        return $this;
+    }
+
+    /**
+     * Sets the maximum allowed size of a single chunk
+     *
+     * Must be at least the chunkSize configured on the client.
+     * PHP's upload_max_filesize and post_max_size also apply.
+     *
+     * @param int $bytes Maximum chunk size in bytes
+     * @return $this Fluent interface for method chaining
+     *
+     * @example
+     * ```php
+     * $endpoint->setMaxChunkSize(10 * 1024 * 1024); // 10MB
+     * ```
+     */
+    public function setMaxChunkSize($bytes) {
+        $this->maxChunkSize = max(1, (int) $bytes);
+        return $this;
+    }
+
+    /**
+     * Sets the maximum number of chunks a single upload may use
+     *
+     * Limits how many files one upload can create in the temporary directory.
+     *
+     * @param int $count Maximum number of chunks
+     * @return $this Fluent interface for method chaining
+     */
+    public function setMaxChunks($count) {
+        $this->maxChunks = max(1, (int) $count);
         return $this;
     }
 
@@ -124,7 +201,8 @@ class TurboPushEndpoint
      * Sets allowed file extensions
      *
      * Only files with these extensions will be accepted.
-     * Extensions are case-insensitive. Empty array allows all extensions.
+     * Extensions are case-insensitive. Empty array allows all extensions
+     * except the blocked ones (see setBlockedExtensions()).
      *
      * @param array $extensions Array of allowed extensions without dots (e.g., ['jpg', 'png'])
      * @return $this Fluent interface for method chaining
@@ -135,8 +213,23 @@ class TurboPushEndpoint
      * ```
      */
     public function setAllowedExtensions($extensions) {
-        // Convert all extensions to lowercase for case-insensitive comparison
-        $this->allowedExtensions = array_map('strtolower', $extensions);
+        $this->allowedExtensions = $this->normalizeExtensions($extensions);
+        return $this;
+    }
+
+    /**
+     * Sets extensions that are always rejected
+     *
+     * By default this blocks extensions a web server may execute (php, phtml,
+     * phar, cgi, asp, jsp and similar). Pass an empty array to disable the
+     * blocklist, for example when uploads are stored outside the web root and
+     * an allowlist is in place.
+     *
+     * @param array $extensions Array of blocked extensions without dots
+     * @return $this Fluent interface for method chaining
+     */
+    public function setBlockedExtensions($extensions) {
+        $this->blockedExtensions = $this->normalizeExtensions($extensions);
         return $this;
     }
 
@@ -144,13 +237,14 @@ class TurboPushEndpoint
      * Enables logging to a file
      *
      * All upload activities will be logged with timestamps.
+     * Keep the log file outside the web root.
      *
      * @param string $logFile Path to log file
      * @return $this Fluent interface for method chaining
      *
      * @example
      * ```php
-     * $endpoint->enableLogging('./logs/turbopush.log');
+     * $endpoint->enableLogging('/var/log/turbopush.log');
      * ```
      */
     public function enableLogging($logFile) {
@@ -161,98 +255,226 @@ class TurboPushEndpoint
     /**
      * Main request handler
      *
-     * Processes incoming requests and routes them to chunk upload or finalization.
-     * Handles CORS preflight requests and error responses.
-     *
-     * This method should be called to handle incoming upload requests.
+     * Processes the current request, sends the JSON response and exits.
+     * Use processRequest() instead when integrating with a framework.
      *
      * @return void Outputs JSON response and exits
      *
      * @example
      * ```php
-     * $endpoint = new TurboPushEndpoint();
+     * $endpoint = new TurboPushEndpoint('/var/www/uploads/');
      * $endpoint->handle(); // Process the current request
      * ```
      */
     public function handle() {
+        $response = $this->processRequest($_SERVER, $_POST, $_FILES, $this->readRequestBody($_SERVER));
+        $this->sendResponse($response);
+        exit;
+    }
+
+    /**
+     * Processes a request without sending output
+     *
+     * Useful for frameworks: pass the request superglobals (or their framework
+     * equivalents) and turn the returned array into a response yourself.
+     *
+     * @param array  $server Server parameters, usually $_SERVER
+     * @param array  $post   Parsed form fields, usually $_POST
+     * @param array  $files  Uploaded files, usually $_FILES
+     * @param string $body   Raw request body (used for JSON requests)
+     * @return array Response as ['status' => int, 'headers' => array, 'body' => array|null]
+     *
+     * @since 1.1.0
+     */
+    public function processRequest(array $server, array $post, array $files, $body = '') {
+        $response = $this->dispatch($server, $post, $files, $body);
+
+        $headers = $response['headers'] + $this->corsHeaders();
+        if ($response['body'] !== null) {
+            $headers += [
+                'Content-Type' => 'application/json; charset=utf-8',
+                'X-Content-Type-Options' => 'nosniff',
+                'Cache-Control' => 'no-store',
+            ];
+        }
+        $response['headers'] = $headers;
+
+        return $response;
+    }
+
+    /**
+     * Routes a request and turns exceptions into error responses
+     *
+     * @param array  $server Server parameters
+     * @param array  $post   Form fields
+     * @param array  $files  Uploaded files
+     * @param string $body   Raw request body
+     * @return array Response array
+     *
+     * @private
+     */
+    private function dispatch(array $server, array $post, array $files, $body) {
         try {
-            // Set CORS headers for cross-origin requests
-            $this->setCorsHeaders();
+            $method = isset($server['REQUEST_METHOD']) ? strtoupper($server['REQUEST_METHOD']) : 'GET';
 
             // Handle CORS preflight requests
-            if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-                http_response_code(200);
-                exit;
+            if ($method === 'OPTIONS') {
+                return ['status' => 204, 'headers' => [], 'body' => null];
             }
 
-            // Read raw input for JSON finalization requests
-            $input = file_get_contents('php://input');
-            $json = json_decode($input, true);
-
-            // Route request to appropriate handler
-            if ($json && isset($json['action']) && $json['action'] === 'finalize') {
-                // JSON request with action=finalize -> merge chunks
-                $this->finalizeUpload($json);
-            } else {
-                // FormData request -> save chunk
-                $this->handleChunk();
+            if ($method !== 'POST') {
+                throw new TurboPushException('Method not allowed', 405);
             }
-        } catch (Exception $e) {
-            // Log and return error response
-            $this->log('ERROR: ' . $e->getMessage());
-            $this->jsonResponse(false, $e->getMessage(), [], 400);
+
+            // Multipart requests carry chunks
+            if (!empty($files) || !empty($post)) {
+                return $this->handleChunk($post, $files);
+            }
+
+            $body = (string) $body;
+            if (strlen($body) > self::MAX_JSON_BODY) {
+                throw new TurboPushException('Request body too large', 413);
+            }
+
+            // JSON requests carry actions
+            $json = $body !== '' ? json_decode($body, true) : null;
+            if (is_array($json) && isset($json['action'])) {
+                return $this->handleAction($json);
+            }
+
+            // PHP drops the whole body when it exceeds post_max_size
+            if ($this->isMultipart($server) && isset($server['CONTENT_LENGTH']) && (int) $server['CONTENT_LENGTH'] > 0) {
+                throw new TurboPushException('Chunk exceeds the server upload size limit', 413);
+            }
+
+            throw new TurboPushException('No file uploaded', 400);
+        } catch (TurboPushException $e) {
+            $this->log('REJECTED (' . $e->getHttpStatus() . '): ' . $e->getMessage());
+            $headers = $e->getHttpStatus() === 405 ? ['Allow' => 'POST, OPTIONS'] : [];
+            return $this->errorResponse($e->getHttpStatus(), $e->getMessage(), $e->getData(), $headers);
+        } catch (\Throwable $e) {
+            // Never expose internal details (paths, PHP errors) to the client
+            $this->log('ERROR: ' . get_class($e) . ': ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+            return $this->errorResponse(500, 'Internal server error', [], []);
+        }
+    }
+
+    /**
+     * Routes a JSON action request
+     *
+     * @param array $data Decoded JSON body
+     * @return array Response array
+     * @throws TurboPushException If the action is unknown
+     *
+     * @private
+     */
+    private function handleAction(array $data) {
+        switch ($data['action']) {
+            case 'finalize':
+                return $this->finalizeUpload($data);
+            default:
+                throw new TurboPushException('Unknown action', 400);
         }
     }
 
     /**
      * Handles individual chunk upload
      *
-     * Validates the request, checks file size and extension, saves the chunk
-     * to temporary storage with zero-padded naming for proper ordering.
+     * Validates the request and its metadata, then stores the chunk in the
+     * upload's temporary directory. Metadata from the first chunk is recorded
+     * and later chunks (and the finalize request) must match it.
      *
-     * @return void Outputs JSON response and exits
-     * @throws Exception If validation fails or chunk cannot be saved
+     * @param array $post  Form fields
+     * @param array $files Uploaded files
+     * @return array Response array
+     * @throws TurboPushException If validation fails
      *
      * @private
      */
-    private function handleChunk() {
+    private function handleChunk(array $post, array $files) {
         // Validate required fields and file upload
-        $this->validateChunkRequest();
+        $upload = $this->validateChunkRequest($post, $files);
 
-        // Extract and sanitize metadata from POST
-        $fileName = $this->sanitizeFileName($_POST['fileName']);
-        $fileId = $_POST['fileId'];
-        $chunkIndex = (int)$_POST['chunkIndex'];
-        $totalChunks = (int)$_POST['totalChunks'];
-        $fileSize = (int)$_POST['fileSize'];
+        // Extract and validate metadata from POST
+        $uploadId = $this->validateUploadId($post['fileId']);
+        $fileName = $this->validateFileName($post['fileName']);
+        $fileSize = $this->parseInteger($post['fileSize'], 'fileSize');
+        $totalChunks = $this->parseInteger($post['totalChunks'], 'totalChunks');
+        $chunkIndex = $this->parseInteger($post['chunkIndex'], 'chunkIndex');
 
-        $this->log("Receiving chunk $chunkIndex/$totalChunks for: $fileName");
+        $this->validateUploadShape($fileSize, $totalChunks);
 
-        // Validate file size doesn't exceed limit
-        if ($fileSize > $this->maxFileSize) {
-            throw new Exception("File size exceeds limit");
+        if ($chunkIndex >= $totalChunks) {
+            throw new TurboPushException('Invalid chunkIndex', 400);
         }
 
-        // Validate file extension if restrictions are set
-        $this->validateFileExtension($fileName);
+        $this->log("Receiving chunk $chunkIndex/$totalChunks for: $fileName ($uploadId)");
 
-        // Create temporary directory for this file's chunks
-        $fileTempDir = $this->tempDir . $this->sanitizeFileName($fileId) . '/';
-        $this->ensureDirectory($fileTempDir);
+        // Create temporary directory for this upload's chunks
+        $fileTempDir = $this->uploadTempDir($uploadId);
+        $this->ensureDirectory($this->tempDir, 0700);
+        $this->ensureDirectory($fileTempDir, 0700);
 
-        // Generate chunk filename with zero-padding for proper sorting
-        // Example: chunk_0000000003 for chunk index 3
-        $chunkPath = $fileTempDir . 'chunk_' . str_pad($chunkIndex, 10, '0', STR_PAD_LEFT);
+        $lock = $this->acquireLock($fileTempDir);
+        $partPath = null;
 
-        // Move uploaded chunk from temp location to final chunk path
-        if (!move_uploaded_file($_FILES['file']['tmp_name'], $chunkPath)) {
-            throw new Exception('Failed to save chunk');
+        try {
+            if (is_file($fileTempDir . self::DONE_FILE)) {
+                throw new TurboPushException('Upload already finalized', 409);
+            }
+
+            $meta = $this->readJsonFile($fileTempDir . self::META_FILE);
+            if ($meta === null) {
+                $meta = [
+                    'fileName' => $fileName,
+                    'fileSize' => $fileSize,
+                    'totalChunks' => $totalChunks,
+                    'receivedBytes' => 0,
+                    'createdAt' => time(),
+                ];
+            } else {
+                $this->assertMetadataMatches($meta, $fileName, $fileSize, $totalChunks);
+            }
+
+            // Write to a unique temporary name first, then rename into place, so a
+            // duplicate or retried chunk can never leave a half-written file behind
+            $chunkPath = $fileTempDir . $this->chunkFileName($chunkIndex);
+            $partPath = $chunkPath . '.' . bin2hex(random_bytes(6)) . '.part';
+
+            if (!$this->moveUploadedFile($upload['tmp_name'], $partPath)) {
+                throw new \RuntimeException('Failed to move uploaded chunk to ' . $partPath);
+            }
+
+            $chunkSize = $this->fileSize($partPath);
+            if ($chunkSize > $this->maxChunkSize) {
+                throw new TurboPushException('Chunk size exceeds limit', 413);
+            }
+
+            // Keep a running total so a client cannot store more than it declared
+            $previousSize = is_file($chunkPath) ? $this->fileSize($chunkPath) : 0;
+            $receivedBytes = (int) $meta['receivedBytes'] - $previousSize + $chunkSize;
+            if ($receivedBytes > $fileSize) {
+                throw new TurboPushException('Upload exceeds the declared file size', 400);
+            }
+
+            if (!rename($partPath, $chunkPath)) {
+                throw new \RuntimeException('Failed to rename chunk to ' . $chunkPath);
+            }
+            $partPath = null;
+
+            $meta['receivedBytes'] = $receivedBytes;
+            $this->writeJsonFile($fileTempDir . self::META_FILE, $meta);
+        } finally {
+            if ($partPath !== null && is_file($partPath)) {
+                @unlink($partPath);
+            }
+            $this->releaseLock($lock);
         }
 
-        $this->log("Chunk $chunkIndex saved");
+        $this->log("Chunk $chunkIndex saved ($uploadId)");
 
         // Return success response
-        $this->jsonResponse(true, 'Chunk uploaded', [
+        return $this->successResponse('Chunk uploaded', [
             'chunkIndex' => $chunkIndex,
             'totalChunks' => $totalChunks
         ]);
@@ -261,8 +483,11 @@ class TurboPushEndpoint
     /**
      * Finalizes upload by merging all chunks into final file
      *
-     * Verifies all chunks are present, merges them in order, validates
-     * final file size, and cleans up temporary files.
+     * Verifies the request matches the recorded metadata and that every chunk
+     * is present, assembles the chunks into a temporary file inside the upload
+     * directory and renames it into place. The operation holds the upload's
+     * lock, so parallel or repeated finalize requests cannot corrupt the file.
+     * Repeating a finalize request after success returns the same result.
      *
      * @param array $data Finalization request data containing:
      *                    - fileName: Name of the final file
@@ -270,139 +495,328 @@ class TurboPushEndpoint
      *                    - fileSize: Expected final file size
      *                    - totalChunks: Total number of chunks
      *
-     * @return void Outputs JSON response and exits
-     * @throws Exception If chunks are missing, merge fails, or size mismatch
+     * @return array Response array
+     * @throws TurboPushException If chunks are missing, merge fails, or size mismatch
      *
      * @private
      */
-    private function finalizeUpload($data) {
-        // Extract finalization data
-        $fileName = $this->sanitizeFileName($data['fileName']);
-        $fileId = $data['fileId'];
-        $fileSize = $data['fileSize'];
-        $totalChunks = $data['totalChunks'];
+    private function finalizeUpload(array $data) {
+        foreach (['fileName', 'fileId', 'fileSize', 'totalChunks'] as $field) {
+            if (!isset($data[$field])) {
+                throw new TurboPushException("Missing: $field", 400);
+            }
+        }
 
-        $this->log("Finalizing: $fileName");
+        // Extract and validate finalization data
+        $uploadId = $this->validateUploadId($data['fileId']);
+        $fileName = $this->validateFileName($data['fileName']);
+        $fileSize = $this->parseInteger($data['fileSize'], 'fileSize');
+        $totalChunks = $this->parseInteger($data['totalChunks'], 'totalChunks');
+
+        $this->validateUploadShape($fileSize, $totalChunks);
+
+        $this->log("Finalizing: $fileName ($uploadId)");
 
         // Locate temporary directory containing chunks
-        $fileTempDir = $this->tempDir . $this->sanitizeFileName($fileId) . '/';
-
+        $fileTempDir = $this->uploadTempDir($uploadId);
         if (!is_dir($fileTempDir)) {
-            throw new Exception("Temp directory not found");
+            throw new TurboPushException('Upload not found', 404);
         }
 
-        // Verify all chunks are present before merging
-        for ($i = 0; $i < $totalChunks; $i++) {
-            $chunkPath = $fileTempDir . 'chunk_' . str_pad($i, 10, '0', STR_PAD_LEFT);
-            if (!file_exists($chunkPath)) {
-                throw new Exception("Missing chunk: $i");
-            }
-        }
+        $lock = $this->acquireLock($fileTempDir);
 
-        // Determine final file path (add timestamp if file exists)
-        $finalPath = $this->uploadDir . $fileName;
-
-        if (file_exists($finalPath)) {
-            // File already exists - append timestamp to make unique
-            $info = pathinfo($fileName);
-            $finalPath = $this->uploadDir . $info['filename'] . '_' . time() .
-                        (isset($info['extension']) ? '.' . $info['extension'] : '');
-        }
-
-        // Open final file for writing
-        $finalFile = fopen($finalPath, 'wb');
-
-        // Merge all chunks in order
-        for ($i = 0; $i < $totalChunks; $i++) {
-            $chunkPath = $fileTempDir . 'chunk_' . str_pad($i, 10, '0', STR_PAD_LEFT);
-            $chunk = fopen($chunkPath, 'rb');
-
-            // Stream chunk data to final file (8KB buffer)
-            while (!feof($chunk)) {
-                fwrite($finalFile, fread($chunk, 8192));
+        try {
+            // A repeated finalize (for example a client retry) returns the original result
+            $done = $this->readJsonFile($fileTempDir . self::DONE_FILE);
+            if ($done !== null) {
+                if ($done['sourceName'] !== $fileName || (int) $done['fileSize'] !== $fileSize) {
+                    throw new TurboPushException('Upload metadata does not match', 409);
+                }
+                return $this->successResponse('Upload complete', [
+                    'fileName' => $done['fileName'],
+                    'fileSize' => (int) $done['fileSize']
+                ]);
             }
 
-            // Close and delete the chunk file
-            fclose($chunk);
-            unlink($chunkPath);
+            $meta = $this->readJsonFile($fileTempDir . self::META_FILE);
+            if ($meta === null) {
+                throw new TurboPushException('Upload not found', 404);
+            }
+            $this->assertMetadataMatches($meta, $fileName, $fileSize, $totalChunks);
+
+            // Verify all chunks are present before merging
+            $missing = [];
+            $totalSize = 0;
+            for ($i = 0; $i < $totalChunks; $i++) {
+                $chunkPath = $fileTempDir . $this->chunkFileName($i);
+                if (!is_file($chunkPath)) {
+                    $missing[] = $i;
+                    continue;
+                }
+                $totalSize += $this->fileSize($chunkPath);
+            }
+
+            if (!empty($missing)) {
+                throw new TurboPushException('Missing chunks', 409, [
+                    'missingChunks' => array_slice($missing, 0, 100)
+                ]);
+            }
+
+            if ($totalSize !== $fileSize) {
+                throw new TurboPushException('File size mismatch', 409);
+            }
+
+            // Assemble into a hidden temporary file next to the destination,
+            // then rename it so the final file appears complete or not at all
+            $this->ensureDirectory($this->uploadDir, 0755);
+            $partPath = $this->uploadDir . '.turbopush-' . bin2hex(random_bytes(8)) . '.part';
+            $this->assembleChunks($fileTempDir, $totalChunks, $partPath);
+
+            try {
+                // Verify final file size matches expected size
+                if ($this->fileSize($partPath) !== $fileSize) {
+                    throw new \RuntimeException('Assembled file size mismatch for ' . $partPath);
+                }
+
+                $finalPath = $this->moveToFinalPath($partPath, $fileName);
+            } catch (\Throwable $e) {
+                @unlink($partPath);
+                throw $e;
+            }
+
+            $result = [
+                'fileName' => basename($finalPath),
+                'fileSize' => $fileSize
+            ];
+
+            // Remember the result so repeated finalize requests are harmless,
+            // then clean up the chunks
+            $this->writeJsonFile($fileTempDir . self::DONE_FILE, $result + ['sourceName' => $fileName]);
+            for ($i = 0; $i < $totalChunks; $i++) {
+                @unlink($fileTempDir . $this->chunkFileName($i));
+            }
+            @unlink($fileTempDir . self::META_FILE);
+        } finally {
+            $this->releaseLock($lock);
         }
 
-        // Close final file
-        fclose($finalFile);
-
-        // Clean up temporary directory
-        @rmdir($fileTempDir);
-
-        // Verify final file size matches expected size
-        $actualSize = filesize($finalPath);
-        if ($actualSize !== $fileSize) {
-            // Size mismatch - delete corrupted file
-            unlink($finalPath);
-            throw new Exception("File size mismatch");
-        }
-
-        $this->log("Complete: $fileName");
+        $this->log("Complete: $fileName -> {$result['fileName']} ($uploadId)");
 
         // Return success response with file information
-        $this->jsonResponse(true, 'Upload complete', [
-            'fileName' => basename($finalPath),
-            'fileSize' => $actualSize
-        ]);
+        return $this->successResponse('Upload complete', $result);
     }
 
     /**
      * Validates chunk upload request
      *
-     * Ensures the request contains a file upload and all required POST fields.
+     * Ensures the request contains a successfully uploaded file and all
+     * required POST fields.
      *
-     * @return void
-     * @throws Exception If validation fails
+     * @param array $post  Form fields
+     * @param array $files Uploaded files
+     * @return array The uploaded file entry from $files
+     * @throws TurboPushException If validation fails
      *
      * @private
      */
-    private function validateChunkRequest() {
+    private function validateChunkRequest(array $post, array $files) {
         // Check for uploaded file
-        if (!isset($_FILES['file'])) {
-            throw new Exception('No file uploaded');
+        if (!isset($files['file']) || !is_array($files['file']) || !isset($files['file']['tmp_name'])) {
+            throw new TurboPushException('No file uploaded', 400);
+        }
+
+        $upload = $files['file'];
+        if (is_array($upload['tmp_name'])) {
+            throw new TurboPushException('Only one chunk per request is allowed', 400);
+        }
+
+        $error = isset($upload['error']) ? (int) $upload['error'] : UPLOAD_ERR_OK;
+        switch ($error) {
+            case UPLOAD_ERR_OK:
+                break;
+            case UPLOAD_ERR_INI_SIZE:
+            case UPLOAD_ERR_FORM_SIZE:
+                throw new TurboPushException('Chunk exceeds the server upload size limit', 413);
+            case UPLOAD_ERR_PARTIAL:
+                throw new TurboPushException('Chunk upload was incomplete', 400);
+            case UPLOAD_ERR_NO_FILE:
+                throw new TurboPushException('No file uploaded', 400);
+            default:
+                // UPLOAD_ERR_NO_TMP_DIR, UPLOAD_ERR_CANT_WRITE, UPLOAD_ERR_EXTENSION
+                throw new \RuntimeException('PHP upload error code ' . $error);
+        }
+
+        if (isset($upload['size']) && (int) $upload['size'] > $this->maxChunkSize) {
+            throw new TurboPushException('Chunk size exceeds limit', 413);
         }
 
         // Check for required POST fields
         $required = ['fileName', 'fileId', 'chunkIndex', 'totalChunks', 'fileSize'];
         foreach ($required as $field) {
-            if (!isset($_POST[$field])) {
-                throw new Exception("Missing: $field");
+            if (!isset($post[$field])) {
+                throw new TurboPushException("Missing: $field", 400);
             }
+        }
+
+        return $upload;
+    }
+
+    /**
+     * Validates an upload ID
+     *
+     * The ID becomes a directory name, so only a strict character set is
+     * accepted. Anything else is rejected rather than rewritten.
+     *
+     * @param mixed $uploadId Upload ID from the request
+     * @return string The validated upload ID
+     * @throws TurboPushException If the ID is invalid
+     *
+     * @private
+     */
+    private function validateUploadId($uploadId) {
+        if (!is_string($uploadId) || !preg_match(self::UPLOAD_ID_PATTERN, $uploadId)) {
+            throw new TurboPushException('Invalid fileId', 400);
+        }
+        return $uploadId;
+    }
+
+    /**
+     * Sanitizes a file name and checks its extension
+     *
+     * @param mixed $fileName File name from the request
+     * @return string The sanitized file name
+     * @throws TurboPushException If the name is missing or its extension is not allowed
+     *
+     * @private
+     */
+    private function validateFileName($fileName) {
+        if (!is_string($fileName) || trim($fileName) === '') {
+            throw new TurboPushException('Missing: fileName', 400);
+        }
+
+        $fileName = $this->sanitizeFileName($fileName);
+        $this->validateFileExtension($fileName);
+
+        return $fileName;
+    }
+
+    /**
+     * Parses a non-negative integer request field
+     *
+     * Accepts integers and strings of digits only, so values such as "-1",
+     * "1e3", "0x10" or "3.5" are rejected instead of being silently cast.
+     *
+     * @param mixed  $value Raw value
+     * @param string $field Field name for the error message
+     * @return int Parsed value
+     * @throws TurboPushException If the value is not a valid non-negative integer
+     *
+     * @private
+     */
+    private function parseInteger($value, $field) {
+        if (is_int($value)) {
+            if ($value < 0) {
+                throw new TurboPushException("Invalid $field", 400);
+            }
+            return $value;
+        }
+
+        if (!is_string($value) || !preg_match('/^[0-9]{1,18}$/', $value)) {
+            throw new TurboPushException("Invalid $field", 400);
+        }
+
+        return (int) $value;
+    }
+
+    /**
+     * Validates file size and chunk count against the configured limits
+     *
+     * @param int $fileSize    Declared file size in bytes
+     * @param int $totalChunks Declared number of chunks
+     * @return void
+     * @throws TurboPushException If a limit is exceeded or the values are inconsistent
+     *
+     * @private
+     */
+    private function validateUploadShape($fileSize, $totalChunks) {
+        // Validate file size doesn't exceed limit
+        if ($fileSize > $this->maxFileSize) {
+            throw new TurboPushException('File size exceeds limit', 413);
+        }
+
+        if ($totalChunks < 1) {
+            throw new TurboPushException('Invalid totalChunks', 400);
+        }
+
+        if ($totalChunks > $this->maxChunks) {
+            throw new TurboPushException('Too many chunks', 413);
+        }
+
+        // Every chunk carries at least one byte, except the single chunk of an empty file
+        if ($totalChunks > max(1, $fileSize)) {
+            throw new TurboPushException('totalChunks does not match fileSize', 400);
+        }
+
+        // The file must fit in totalChunks chunks of at most maxChunkSize bytes
+        if ($fileSize > $totalChunks * $this->maxChunkSize) {
+            throw new TurboPushException('Chunk size exceeds limit', 413);
         }
     }
 
     /**
-     * Validates file extension against allowed list
+     * Checks request metadata against the metadata recorded for the upload
      *
-     * Only checks if allowedExtensions is not empty.
+     * @param array  $meta        Recorded metadata
+     * @param string $fileName    Sanitized file name from the request
+     * @param int    $fileSize    File size from the request
+     * @param int    $totalChunks Chunk count from the request
+     * @return void
+     * @throws TurboPushException If anything differs
+     *
+     * @private
+     */
+    private function assertMetadataMatches(array $meta, $fileName, $fileSize, $totalChunks) {
+        if ($meta['fileName'] !== $fileName
+            || (int) $meta['fileSize'] !== $fileSize
+            || (int) $meta['totalChunks'] !== $totalChunks) {
+            throw new TurboPushException('Upload metadata does not match', 409);
+        }
+    }
+
+    /**
+     * Validates file extension against the blocklist and the allowlist
+     *
      * Extensions are compared case-insensitively.
      *
      * @param string $fileName Name of file to validate
      * @return void
-     * @throws Exception If file extension is not allowed
+     * @throws TurboPushException If file extension is not allowed
      *
      * @private
      */
     private function validateFileExtension($fileName) {
-        // Skip validation if no restrictions set
-        if (empty($this->allowedExtensions)) return;
-
         // Extract and check extension
         $ext = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
-        if (!in_array($ext, $this->allowedExtensions)) {
-            throw new Exception("File type not allowed: .$ext");
+        $label = $ext === '' ? 'File type not allowed' : "File type not allowed: .$ext";
+
+        if ($ext !== '' && in_array($ext, $this->blockedExtensions, true)) {
+            throw new TurboPushException($label, 415);
+        }
+
+        // Skip allowlist validation if no restrictions set
+        if (!empty($this->allowedExtensions) && !in_array($ext, $this->allowedExtensions, true)) {
+            throw new TurboPushException($label, 415);
         }
     }
 
     /**
      * Sanitizes filename for safe filesystem storage
      *
-     * Removes directory traversal attempts, special characters, and
-     * truncates long filenames while preserving extension.
+     * Keeps only the last path segment, replaces anything other than letters,
+     * digits, dot, dash and underscore, strips leading and trailing dots (no
+     * hidden files such as .htaccess or .user.ini), neutralises blocked inner
+     * extensions (shell.php.jpg becomes shell_php.jpg), avoids Windows device
+     * names and truncates long names while preserving the extension.
      *
      * @param string $fileName Original filename
      * @return string Sanitized filename safe for storage
@@ -410,56 +824,371 @@ class TurboPushEndpoint
      * @private
      */
     private function sanitizeFileName($fileName) {
-        // Remove directory components (prevent traversal attacks)
-        $fileName = basename($fileName);
+        // Remove directory components (prevent traversal attacks), on any platform
+        $fileName = str_replace(["\0", '\\'], ['', '/'], (string) $fileName);
+        $slash = strrpos($fileName, '/');
+        if ($slash !== false) {
+            $fileName = substr($fileName, $slash + 1);
+        }
 
         // Replace special characters with underscores (keep alphanumeric, dot, dash)
         $fileName = preg_replace('/[^a-zA-Z0-9._-]/', '_', $fileName);
 
-        // Truncate long filenames to 255 characters (filesystem limit)
-        if (strlen($fileName) > 255) {
-            $ext = pathinfo($fileName, PATHINFO_EXTENSION);
-            $name = substr($fileName, 0, 250 - strlen($ext));
+        // No hidden files, no "..", no trailing dots (Windows drops them)
+        $fileName = trim($fileName, '.');
+
+        // Neutralise blocked extensions in the middle of the name
+        $parts = explode('.', $fileName);
+        if (count($parts) > 2) {
+            $name = array_shift($parts);
+            $ext = array_pop($parts);
+            foreach ($parts as $part) {
+                $name .= (in_array(strtolower($part), $this->blockedExtensions, true) ? '_' : '.') . $part;
+            }
             $fileName = $name . '.' . $ext;
+        }
+
+        // Avoid Windows device names such as CON or NUL
+        if (preg_match('/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i', $fileName)) {
+            $fileName = '_' . $fileName;
+        }
+
+        if ($fileName === '') {
+            $fileName = 'file';
+        }
+
+        // Truncate long filenames, leaving room for a collision suffix
+        if (strlen($fileName) > 200) {
+            $ext = pathinfo($fileName, PATHINFO_EXTENSION);
+            if ($ext !== '' && strlen($ext) <= 20) {
+                $fileName = substr($fileName, 0, 200 - strlen($ext) - 1) . '.' . $ext;
+            } else {
+                $fileName = substr($fileName, 0, 200);
+            }
         }
 
         return $fileName;
     }
 
     /**
-     * Ensures a directory exists, creating it if necessary
+     * Normalizes a list of extensions: lowercase, without leading dots
      *
-     * Creates directory with proper permissions (0755) and parent directories.
-     *
-     * @param string $dir Directory path to ensure exists
-     * @return void
-     * @throws Exception If directory cannot be created
+     * @param array $extensions Extensions to normalize
+     * @return array Normalized extensions
      *
      * @private
      */
-    private function ensureDirectory($dir) {
-        if (!is_dir($dir)) {
-            // Create directory with parents, 0755 permissions
-            if (!mkdir($dir, 0755, true)) {
-                throw new Exception("Failed to create dir: $dir");
+    private function normalizeExtensions($extensions) {
+        $normalized = [];
+        foreach ((array) $extensions as $extension) {
+            $extension = strtolower(ltrim(trim((string) $extension), '.'));
+            if ($extension !== '') {
+                $normalized[] = $extension;
             }
+        }
+        return array_values(array_unique($normalized));
+    }
+
+    /**
+     * Assembles chunks in order into a new file
+     *
+     * @param string $fileTempDir Directory holding the chunks
+     * @param int    $totalChunks Number of chunks
+     * @param string $targetPath  File to create (must not exist)
+     * @return void
+     * @throws \RuntimeException If any file operation fails
+     *
+     * @private
+     */
+    private function assembleChunks($fileTempDir, $totalChunks, $targetPath) {
+        // Open final file for writing; 'x' fails if the file already exists
+        $out = @fopen($targetPath, 'xb');
+        if ($out === false) {
+            throw new \RuntimeException('Failed to create ' . $targetPath);
+        }
+
+        try {
+            // Merge all chunks in order
+            for ($i = 0; $i < $totalChunks; $i++) {
+                $chunkPath = $fileTempDir . $this->chunkFileName($i);
+                $in = @fopen($chunkPath, 'rb');
+                if ($in === false) {
+                    throw new \RuntimeException('Failed to open ' . $chunkPath);
+                }
+                $copied = stream_copy_to_stream($in, $out);
+                fclose($in);
+                if ($copied === false) {
+                    throw new \RuntimeException('Failed to copy ' . $chunkPath);
+                }
+            }
+
+            if (!fflush($out)) {
+                throw new \RuntimeException('Failed to flush ' . $targetPath);
+            }
+        } catch (\Throwable $e) {
+            fclose($out);
+            @unlink($targetPath);
+            throw $e;
+        }
+
+        fclose($out);
+    }
+
+    /**
+     * Moves an assembled file to its final name without overwriting anything
+     *
+     * Tries the sanitized name first, then name_<timestamp>.ext, then
+     * name_<timestamp>_<n>.ext. Each candidate is reserved with an exclusive
+     * create, so two uploads of the same name can never overwrite each other.
+     *
+     * @param string $partPath Assembled temporary file
+     * @param string $fileName Sanitized file name
+     * @return string Final path
+     * @throws \RuntimeException If no name could be reserved
+     *
+     * @private
+     */
+    private function moveToFinalPath($partPath, $fileName) {
+        $info = pathinfo($fileName);
+        $base = $info['filename'];
+        $ext = isset($info['extension']) && $info['extension'] !== '' ? '.' . $info['extension'] : '';
+        $timestamp = time();
+
+        for ($attempt = 0; $attempt < 100; $attempt++) {
+            if ($attempt === 0) {
+                $candidate = $fileName;
+            } elseif ($attempt === 1) {
+                $candidate = $base . '_' . $timestamp . $ext;
+            } else {
+                $candidate = $base . '_' . $timestamp . '_' . ($attempt - 1) . $ext;
+            }
+
+            $finalPath = $this->uploadDir . $candidate;
+            $handle = @fopen($finalPath, 'xb');
+            if ($handle === false) {
+                if (file_exists($finalPath)) {
+                    continue; // Name taken, try the next one
+                }
+                throw new \RuntimeException('Failed to create ' . $finalPath);
+            }
+            fclose($handle);
+
+            if (!rename($partPath, $finalPath)) {
+                @unlink($finalPath);
+                throw new \RuntimeException('Failed to move ' . $partPath . ' to ' . $finalPath);
+            }
+
+            return $finalPath;
+        }
+
+        throw new \RuntimeException('Could not find a free file name for ' . $fileName);
+    }
+
+    /**
+     * Moves an uploaded file into place
+     *
+     * Wraps move_uploaded_file(), which refuses anything that was not
+     * uploaded in the current request. Kept separate so tests can override it.
+     *
+     * @param string $from Temporary upload path
+     * @param string $to   Destination path
+     * @return bool True on success
+     */
+    protected function moveUploadedFile($from, $to) {
+        return @move_uploaded_file($from, $to);
+    }
+
+    /**
+     * Gets the temporary directory for an upload
+     *
+     * @param string $uploadId Validated upload ID
+     * @return string Directory path with trailing slash
+     *
+     * @private
+     */
+    private function uploadTempDir($uploadId) {
+        return $this->tempDir . $uploadId . '/';
+    }
+
+    /**
+     * Gets the file name of a chunk, zero-padded for proper sorting
+     *
+     * @param int $index Chunk index
+     * @return string For example chunk_0000000003 for index 3
+     *
+     * @private
+     */
+    private function chunkFileName($index) {
+        return 'chunk_' . str_pad((string) $index, 10, '0', STR_PAD_LEFT);
+    }
+
+    /**
+     * Gets the default temporary directory
+     *
+     * A folder under sys_get_temp_dir(), outside the web root. The name
+     * includes a hash of the upload directory so separate sites on the same
+     * server do not share (or fight over permissions on) the same folder.
+     *
+     * @return string Directory path
+     *
+     * @private
+     */
+    private function defaultTempDir() {
+        $uploadDir = $this->uploadDir;
+        if (!preg_match('#^([A-Za-z]:)?[/\\\\]#', $uploadDir)) {
+            $uploadDir = getcwd() . '/' . $uploadDir;
+        }
+        return rtrim(sys_get_temp_dir(), '/\\') . '/turbopush-' . substr(sha1($uploadDir), 0, 12);
+    }
+
+    /**
+     * Opens and exclusively locks an upload's lock file
+     *
+     * @param string $fileTempDir Upload directory
+     * @return resource Lock handle
+     * @throws \RuntimeException If the lock cannot be acquired
+     *
+     * @private
+     */
+    private function acquireLock($fileTempDir) {
+        $handle = @fopen($fileTempDir . self::LOCK_FILE, 'c');
+        if ($handle === false) {
+            throw new \RuntimeException('Failed to open lock file in ' . $fileTempDir);
+        }
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            throw new \RuntimeException('Failed to lock ' . $fileTempDir);
+        }
+        return $handle;
+    }
+
+    /**
+     * Releases a lock acquired with acquireLock()
+     *
+     * @param resource $handle Lock handle
+     * @return void
+     *
+     * @private
+     */
+    private function releaseLock($handle) {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+
+    /**
+     * Reads a JSON file
+     *
+     * @param string $path File path
+     * @return array|null Decoded data, or null if the file does not exist
+     * @throws \RuntimeException If the file exists but cannot be read
+     *
+     * @private
+     */
+    private function readJsonFile($path) {
+        if (!is_file($path)) {
+            return null;
+        }
+        $data = json_decode((string) file_get_contents($path), true);
+        if (!is_array($data)) {
+            throw new \RuntimeException('Corrupt metadata file ' . $path);
+        }
+        return $data;
+    }
+
+    /**
+     * Writes a JSON file atomically
+     *
+     * @param string $path File path
+     * @param array  $data Data to write
+     * @return void
+     * @throws \RuntimeException If the file cannot be written
+     *
+     * @private
+     */
+    private function writeJsonFile($path, array $data) {
+        $tmp = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
+        if (file_put_contents($tmp, json_encode($data)) === false || !rename($tmp, $path)) {
+            @unlink($tmp);
+            throw new \RuntimeException('Failed to write ' . $path);
         }
     }
 
     /**
-     * Sets CORS headers for cross-origin requests
+     * Gets the size of a file, bypassing PHP's stat cache
      *
-     * Allows requests from any origin (adjust for production security).
-     *
-     * @return void
+     * @param string $path File path
+     * @return int Size in bytes
      *
      * @private
      */
-    private function setCorsHeaders() {
+    private function fileSize($path) {
+        clearstatcache(true, $path);
+        return (int) filesize($path);
+    }
+
+    /**
+     * Ensures a directory exists, creating it if necessary
+     *
+     * @param string $dir  Directory path to ensure exists
+     * @param int    $mode Permissions for a new directory
+     * @return void
+     * @throws \RuntimeException If directory cannot be created
+     *
+     * @private
+     */
+    private function ensureDirectory($dir, $mode) {
+        if (!is_dir($dir) && !@mkdir($dir, $mode, true) && !is_dir($dir)) {
+            throw new \RuntimeException('Failed to create directory ' . $dir);
+        }
+    }
+
+    /**
+     * Checks whether the request is multipart/form-data
+     *
+     * @param array $server Server parameters
+     * @return bool
+     *
+     * @private
+     */
+    private function isMultipart(array $server) {
+        return isset($server['CONTENT_TYPE']) && stripos($server['CONTENT_TYPE'], 'multipart/form-data') === 0;
+    }
+
+    /**
+     * Reads the raw request body for JSON requests
+     *
+     * Multipart bodies are parsed by PHP into $_POST and $_FILES, so they are
+     * not read here. At most MAX_JSON_BODY + 1 bytes are read.
+     *
+     * @param array $server Server parameters
+     * @return string Request body
+     *
+     * @private
+     */
+    private function readRequestBody(array $server) {
+        if ($this->isMultipart($server)) {
+            return '';
+        }
+        $body = file_get_contents('php://input', false, null, 0, self::MAX_JSON_BODY + 1);
+        return $body === false ? '' : $body;
+    }
+
+    /**
+     * Builds the CORS headers for a response
+     *
+     * Allows requests from any origin (adjust for production security).
+     *
+     * @return array Header name => value
+     *
+     * @private
+     */
+    private function corsHeaders() {
         // WARNING: Allow-Origin: * is permissive. Restrict in production.
-        header('Access-Control-Allow-Origin: *');
-        header('Access-Control-Allow-Methods: POST, OPTIONS');
-        header('Access-Control-Allow-Headers: Content-Type, Authorization');
+        return [
+            'Access-Control-Allow-Origin' => '*',
+            'Access-Control-Allow-Methods' => 'POST, OPTIONS',
+            'Access-Control-Allow-Headers' => 'Content-Type, Authorization',
+        ];
     }
 
     /**
@@ -475,38 +1204,69 @@ class TurboPushEndpoint
     private function log($message) {
         if ($this->logFile) {
             $timestamp = date('Y-m-d H:i:s');
-            file_put_contents($this->logFile, "[$timestamp] $message\n", FILE_APPEND);
+            @file_put_contents($this->logFile, "[$timestamp] $message\n", FILE_APPEND | LOCK_EX);
         }
     }
 
     /**
-     * Sends a JSON response and exits
+     * Builds a success response
      *
-     * Sets appropriate headers, HTTP status code, and outputs JSON.
-     *
-     * @param bool   $success  Whether the operation was successful
-     * @param string $message  Human-readable message
-     * @param array  $data     Additional data to include in response
-     * @param int    $httpCode HTTP status code (default: 200)
-     * @return void Outputs JSON and exits script
+     * @param string $message Human-readable message
+     * @param array  $data    Additional data to include in response
+     * @return array Response array
      *
      * @private
      */
-    private function jsonResponse($success, $message, $data = [], $httpCode = 200) {
-        // Set HTTP status code
-        http_response_code($httpCode);
+    private function successResponse($message, array $data = []) {
+        return [
+            'status' => 200,
+            'headers' => [],
+            'body' => ['success' => true, 'message' => $message, 'data' => $data],
+        ];
+    }
 
-        // Set JSON content type
-        header('Content-Type: application/json');
+    /**
+     * Builds an error response
+     *
+     * @param int    $status  HTTP status code
+     * @param string $message Client-safe message
+     * @param array  $data    Additional data to include in response
+     * @param array  $headers Response headers
+     * @return array Response array
+     *
+     * @private
+     */
+    private function errorResponse($status, $message, array $data, array $headers) {
+        return [
+            'status' => $status,
+            'headers' => $headers,
+            'body' => ['success' => false, 'message' => $message, 'data' => $data],
+        ];
+    }
+
+    /**
+     * Sends a response array
+     *
+     * Sets the HTTP status code and headers and outputs the JSON body.
+     *
+     * @param array $response Response array from processRequest()
+     * @return void
+     *
+     * @private
+     */
+    private function sendResponse(array $response) {
+        // Set HTTP status code
+        http_response_code($response['status']);
+
+        if (!headers_sent()) {
+            foreach ($response['headers'] as $name => $value) {
+                header($name . ': ' . $value);
+            }
+        }
 
         // Output JSON response
-        echo json_encode([
-            'success' => $success,
-            'message' => $message,
-            'data' => $data
-        ]);
-
-        // Exit to prevent further output
-        exit;
+        if ($response['body'] !== null) {
+            echo json_encode($response['body']);
+        }
     }
 }
