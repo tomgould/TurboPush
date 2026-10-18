@@ -6,6 +6,10 @@
  * resuming across page reloads. Designed for uploading large files
  * efficiently and reliably.
  *
+ * Speaks two protocols: TurboPush's own (the default, for the bundled PHP
+ * endpoint) and tus 1.0.0 (https://tus.io), for any tus server such as
+ * tusd, tus-node-server or tus-php.
+ *
  * @module TurboPush
  * @version 2.0.0
  * @license MIT
@@ -107,7 +111,82 @@ interface TurboPushConfig {
      * @default false
      */
     resumable?: boolean;
+
+    /**
+     * Upload protocol (default: 'turbopush')
+     * - 'turbopush': TurboPush's own protocol, spoken by the bundled PHP endpoint
+     * - 'tus': the tus 1.0.0 open protocol; `endpoint` is the tus creation URL,
+     *   such as https://example.com/files/
+     * @default 'turbopush'
+     * @since 2.1.0
+     */
+    protocol?: TurboPushProtocol;
+
+    /**
+     * Options for the tus protocol, ignored by the TurboPush protocol
+     * @since 2.1.0
+     */
+    tus?: TusOptions;
 }
+
+/**
+ * Upload protocol spoken by the client
+ * @since 2.1.0
+ */
+type TurboPushProtocol = 'turbopush' | 'tus';
+
+/**
+ * Options for the tus protocol
+ *
+ * @interface TusOptions
+ * @since 2.1.0
+ */
+interface TusOptions {
+    /**
+     * Extra Upload-Metadata entries for each upload, or a function that
+     * returns them for a file. `filename` and `filetype` are always sent,
+     * taken from the File, unless set here. Keys must be non-empty ASCII
+     * without spaces or commas. The function is called once per file;
+     * exceptions it throws are reported asynchronously (like callback
+     * exceptions) and the default metadata is used.
+     */
+    metadata?: Record<string, string> | ((file: File) => Record<string, string>);
+
+    /**
+     * Upload the chunks of a file in parallel when the server supports the
+     * concatenation extension (default: true). The file is split into up to
+     * maxConcurrentUploads partial uploads that are joined at the end. Set to
+     * false for a server whose concatenation support does not follow the spec.
+     * Without concatenation, a file's chunks are always sent one after another
+     * (several files still upload at once).
+     * @default true
+     */
+    parallel?: boolean;
+
+    /**
+     * Send an Upload-Checksum header with every chunk when the server supports
+     * the checksum extension with sha1, sha256, sha384 or sha512 and Web
+     * Crypto is available (default: true)
+     * @default true
+     */
+    checksum?: boolean;
+}
+
+/**
+ * tus options with defaults applied
+ * @private
+ */
+interface ResolvedTusOptions {
+    metadata: TusOptions['metadata'];
+    parallel: boolean;
+    checksum: boolean;
+}
+
+/**
+ * Configuration with defaults applied
+ * @private
+ */
+type ResolvedConfig = Required<Omit<TurboPushConfig, 'tus'>> & { tus: ResolvedTusOptions };
 
 /**
  * Status of a file upload
@@ -129,6 +208,12 @@ interface UploadResult {
 
     /** Stored file size in bytes */
     fileSize?: number;
+
+    /**
+     * tus only: URL of the finished upload on the tus server
+     * @since 2.1.0
+     */
+    uploadUrl?: string;
 
     /** Any extra fields returned by the server */
     [key: string]: unknown;
@@ -321,11 +406,20 @@ interface ChunkInfo {
     /** Zero-based index of this chunk */
     index: number;
 
-    /** Starting byte position in the file */
+    /** Starting byte position of the data still to send */
     start: number;
 
     /** Ending byte position in the file (exclusive) */
     end: number;
+
+    /**
+     * Original starting position. Differs from start once a tus server has
+     * stored part of the chunk
+     */
+    origin: number;
+
+    /** Index of the tus upload (lane) the chunk belongs to; always 0 for TurboPush */
+    lane: number;
 
     /** The actual chunk data as a Blob */
     blob: Blob;
@@ -358,6 +452,8 @@ interface FileEntry {
     finalizing: boolean;
     /** True if the upload ID was restored from storage (resumable mode) */
     restored: boolean;
+    /** tus protocol state, null for the TurboPush protocol or before planning */
+    tus: TusState | null;
     /** Timer handles of chunks waiting to be retried */
     retryTimers: Set<ReturnType<typeof setTimeout>>;
     /** Speed calculation state */
@@ -396,13 +492,101 @@ interface InFlightRequest {
 }
 
 /**
+ * One tus upload. A file is one upload, or with the concatenation extension
+ * several partial uploads (lanes) covering consecutive byte ranges
+ *
+ * @interface TusLane
+ * @private
+ */
+interface TusLane {
+    /** Upload URL once the upload has been created */
+    url: string | null;
+    /** First byte of the file in this upload */
+    start: number;
+    /** End of the byte range (exclusive) */
+    end: number;
+    /** False when the server's offset may differ from what the client knows */
+    synced: boolean;
+    /** Times the server lost the upload or data, to stop endless recovery */
+    recoveries: number;
+}
+
+/**
+ * tus state of one file
+ *
+ * @interface TusState
+ * @private
+ */
+interface TusState {
+    /** True when the lanes are partial uploads joined by concatenation */
+    parallel: boolean;
+    lanes: TusLane[];
+    /** URL of the final upload created by concatenation */
+    finalUrl: string | null;
+    /** Encoded Upload-Metadata header value */
+    metadata: string;
+}
+
+/**
+ * What a tus server announced in its OPTIONS response
+ *
+ * @interface TusCapabilities
+ * @private
+ */
+interface TusCapabilities {
+    /** Tus-Extension values, lowercased */
+    extensions: string[];
+    /** Tus-Max-Size, or null if not announced */
+    maxSize: number | null;
+    /** Tus-Checksum-Algorithm values, lowercased */
+    checksumAlgorithms: string[];
+}
+
+/**
+ * tus upload state kept in localStorage in resumable mode
+ *
+ * @interface SavedTusUpload
+ * @private
+ */
+interface SavedTusUpload {
+    v: 1;
+    fileId: string;
+    parallel: boolean;
+    lanes: { url: string | null; start: number; end: number }[];
+}
+
+/**
  * Thrown internally when a chunk request was aborted by pause()
  * @private
  */
 class PausedSignal extends Error {}
 
+/**
+ * Thrown internally when a tus chunk must wait because an earlier chunk of
+ * the same upload has to be sent (again) first
+ * @private
+ */
+class RequeueSignal extends Error {}
+
 /** Upload IDs the server accepts */
 const UPLOAD_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+
+/** tus protocol version spoken by the client */
+const TUS_VERSION = '1.0.0';
+
+/** tus checksum algorithms Web Crypto can compute, in order of preference */
+const TUS_CHECKSUMS: ReadonlyArray<readonly [string, string]> = [
+    ['sha256', 'SHA-256'],
+    ['sha512', 'SHA-512'],
+    ['sha384', 'SHA-384'],
+    ['sha1', 'SHA-1']
+];
+
+/** How often a tus upload may be lost (or lose data) on the server before the file fails */
+const TUS_MAX_RECOVERIES = 3;
+
+/** A valid tus metadata key: printable ASCII without spaces or commas */
+const TUS_METADATA_KEY = /^[\x21-\x2B\x2D-\x7E]+$/;
 
 /**
  * TurboPush - Main file upload class
@@ -415,7 +599,10 @@ const UPLOAD_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
  */
 export class TurboPush {
     /** Validated and normalized configuration with all defaults applied */
-    private config: Required<TurboPushConfig>;
+    private config: ResolvedConfig;
+
+    /** What the tus server announced, once discovered */
+    private tusCapabilities: TusCapabilities | null = null;
 
     /** Map of fileId -> file state, in the order files were added */
     private entries: Map<string, FileEntry> = new Map();
@@ -451,7 +638,7 @@ export class TurboPush {
      * Creates a new TurboPush instance
      *
      * @param {TurboPushConfig} config - Configuration options
-     * @throws {Error} If endpoint is not provided
+     * @throws {Error} If endpoint is not provided, the protocol is unknown or a tus metadata key is invalid
      *
      * @example
      * ```typescript
@@ -469,6 +656,20 @@ export class TurboPush {
             throw new Error('TurboPush: endpoint is required');
         }
 
+        const protocol = config.protocol === undefined ? 'turbopush' : config.protocol;
+        if (protocol !== 'turbopush' && protocol !== 'tus') {
+            throw new Error('TurboPush: protocol must be "turbopush" or "tus"');
+        }
+
+        const tus = config.tus || {};
+        if (tus.metadata && typeof tus.metadata === 'object') {
+            for (const key of Object.keys(tus.metadata)) {
+                if (!TUS_METADATA_KEY.test(key)) {
+                    throw new Error(`TurboPush: invalid tus metadata key "${key}"`);
+                }
+            }
+        }
+
         const retryDelay = Math.max(100, TurboPush.positive(config.retryDelay, 1000)); // Minimum 100ms
 
         // Apply defaults and constraints to configuration
@@ -482,7 +683,13 @@ export class TurboPush {
             timeout: Math.max(5000, TurboPush.positive(config.timeout, 30000)), // Minimum 5s
             headers: config.headers || {},
             withCredentials: config.withCredentials || false,
-            resumable: config.resumable || false
+            resumable: config.resumable || false,
+            protocol,
+            tus: {
+                metadata: tus.metadata,
+                parallel: tus.parallel !== false,
+                checksum: tus.checksum !== false
+            }
         };
 
         // Initialize statistics
@@ -504,9 +711,23 @@ export class TurboPush {
     public addFile(file: File): this {
         let fileId: string | null = null;
         let restored = false;
+        let tus: TusState | null = null;
 
         // In resumable mode, reuse the ID of an earlier, unfinished upload of this file
-        if (this.config.resumable) {
+        if (this.config.resumable && this.config.protocol === 'tus') {
+            // tus: the saved state holds the upload URLs; it is written once an upload exists
+            const saved = TurboPush.parseSavedTus(this.storageGet(this.storageKey(file)), file.size);
+            if (saved && !this.entries.has(saved.fileId)) {
+                fileId = saved.fileId;
+                restored = true;
+                tus = {
+                    parallel: saved.parallel,
+                    lanes: saved.lanes.map(lane => TurboPush.newLane(lane.url, lane.start, lane.end)),
+                    finalUrl: null,
+                    metadata: ''
+                };
+            }
+        } else if (this.config.resumable) {
             const key = this.storageKey(file);
             const stored = this.storageGet(key);
             const valid = stored !== null && UPLOAD_ID_PATTERN.test(stored);
@@ -541,6 +762,7 @@ export class TurboPush {
             started: false,
             finalizing: false,
             restored,
+            tus,
             retryTimers: new Set(),
             lastSpeedTime: 0,
             lastSpeedBytes: 0
@@ -869,7 +1091,9 @@ export class TurboPush {
     /**
      * Cancels all uploads and clears the queue
      * Aborts all active requests, asks the server to delete the chunks of
-     * unfinished files, removes all queued files and resets the statistics.
+     * unfinished files (with tus: a DELETE request, if the server supports
+     * the termination extension), removes all queued files and resets the
+     * statistics.
      * A pending push() promise resolves with `cancelled: true`; onComplete
      * is not called. Cannot be resumed after cancellation.
      *
@@ -895,7 +1119,9 @@ export class TurboPush {
                 clearTimeout(timer);
             }
             if (entry.progress.status !== 'completed') {
-                if (entry.started || entry.restored) {
+                if (entry.tus) {
+                    this.tusTerminate(entry);
+                } else if (entry.started || entry.restored) {
                     this.sendAbort(fileId);
                 }
                 this.storageRemove(entry);
@@ -1027,6 +1253,15 @@ export class TurboPush {
         delete this.stats.duration;
         delete this.stats.averageSpeed;
 
+        // tus: learn which extensions the server supports before planning uploads
+        if (this.config.protocol === 'tus') {
+            await this.tusDiscover();
+            if (session.cancelled) {
+                await finished;
+                return session.cancelledStats!;
+            }
+        }
+
         // Prepare every file that still needs uploading
         for (const [fileId, entry] of this.entries) {
             if (entry.progress.status === 'completed') {
@@ -1038,7 +1273,9 @@ export class TurboPush {
             }
             if (!entry.chunks) {
                 entry.chunkSize = this.config.chunkSize;
-                entry.chunks = this.createChunks(entry.file, entry.chunkSize);
+                entry.chunks = this.config.protocol === 'tus'
+                    ? this.tusPlan(entry)
+                    : this.createChunks(entry.file, entry.chunkSize);
             }
             // Give every unfinished chunk a fresh retry budget
             for (const chunk of entry.chunks) {
@@ -1113,6 +1350,8 @@ export class TurboPush {
             if (status === 'completed' || status === 'failed') {
                 continue;
             }
+            // tus: each upload takes its chunks one at a time, in order
+            const startable = entry.tus ? TurboPush.tusStartable(entry.chunks) : null;
             for (const chunk of entry.chunks) {
                 // A callback run by startChunk() may have paused or cancelled
                 if (session.cancelled || this.isPaused || this.session !== session) {
@@ -1121,7 +1360,7 @@ export class TurboPush {
                 if (session.activeChunks >= this.config.maxConcurrentUploads) {
                     return;
                 }
-                if (chunk.state === 'pending') {
+                if (chunk.state === 'pending' && (!startable || startable.has(chunk.index))) {
                     this.startChunk(session, entry, chunk);
                 }
             }
@@ -1231,8 +1470,11 @@ export class TurboPush {
         }
 
         // Aborted by pause(), because another chunk failed, or after the
-        // session ended: send again later
-        if (this.session !== session || error instanceof PausedSignal || entry.progress.status === 'failed') {
+        // session ended, or (tus) an earlier chunk must go first: send again later
+        if (this.session !== session
+            || error instanceof PausedSignal
+            || error instanceof RequeueSignal
+            || entry.progress.status === 'failed') {
             chunk.state = 'pending';
             return;
         }
@@ -1356,6 +1598,14 @@ export class TurboPush {
      * @private
      */
     private resetLostChunks(entry: FileEntry, error: TurboPushError): void {
+        // tus: the partial uploads expired before they were joined, start over
+        if (entry.tus) {
+            if (error.status === 404 || error.status === 410) {
+                this.tusReset(entry);
+            }
+            return;
+        }
+
         if (!entry.chunks || (error.status !== 404 && error.status !== 409)) {
             return;
         }
@@ -1431,6 +1681,9 @@ export class TurboPush {
      */
     private async restoreFromServer(session: Session, fileId: string): Promise<void> {
         const entry = this.entries.get(fileId);
+        if (entry && entry.tus) {
+            return this.tusRestore(session, entry);
+        }
         if (!entry || !entry.restored || entry.started || !entry.chunks) {
             return;
         }
@@ -1513,6 +1766,10 @@ export class TurboPush {
      * @throws {TurboPushError|PausedSignal} If upload fails, times out or is paused
      */
     private async uploadChunk(entry: FileEntry, chunk: ChunkInfo): Promise<void> {
+        if (entry.tus) {
+            return this.tusUploadChunk(entry, chunk);
+        }
+
         const fileId = entry.progress.fileId;
 
         // Prepare form data with metadata first, then the chunk
@@ -1549,6 +1806,10 @@ export class TurboPush {
      * @throws {TurboPushError} If finalization fails
      */
     private async finalizeUpload(entry: FileEntry): Promise<UploadResult> {
+        if (entry.tus) {
+            return this.tusFinalize(entry);
+        }
+
         const fileId = entry.progress.fileId;
         const body = await this.request(fileId, `${fileId}:finalize`, 'finalize', {
             method: 'POST',
@@ -1611,6 +1872,72 @@ export class TurboPush {
         chunkIndex?: number,
         failureMessage: string = 'Upload failed'
     ): Promise<Record<string, any>> {
+        const { response, body } = await this.send(
+            fileId, key, kind, this.config.endpoint, init, chunkIndex, TurboPush.readJson
+        );
+
+        const result = (body && typeof body === 'object' ? body : null) as Record<string, any> | null;
+        const serverMessage = result && typeof (result.message ?? result.error) === 'string'
+            ? (result.message ?? result.error) as string
+            : null;
+
+        // Check for HTTP errors
+        if (!response.ok) {
+            const status = response.status;
+            throw new TurboPushError(
+                serverMessage || `HTTP ${status}${response.statusText ? ': ' + response.statusText : ''}`,
+                {
+                    code: 'http',
+                    status,
+                    retryable: status === 408 || status === 429 || status >= 500,
+                    chunkIndex,
+                    data: result ? result.data : undefined
+                }
+            );
+        }
+
+        // Parse and validate response
+        if (!result) {
+            throw new TurboPushError('Invalid response from server', {
+                code: 'invalid_response', status: response.status, retryable: true, chunkIndex
+            });
+        }
+        if (!result.success) {
+            throw new TurboPushError(serverMessage || failureMessage, {
+                code: 'server', status: response.status, retryable: false, chunkIndex, data: result.data
+            });
+        }
+
+        return result;
+    }
+
+    /**
+     * Sends one HTTP request with a timeout, registered so pause() and
+     * cancel() can abort it, and reads the response body
+     *
+     * Network failures, timeouts and deliberate aborts become a
+     * TurboPushError (or a PausedSignal); HTTP error statuses do not, the
+     * caller checks the response.
+     *
+     * @private
+     * @param {string} fileId - Upload ID the request belongs to
+     * @param {string} key - Unique key for the in-flight request
+     * @param {string} kind - Request kind
+     * @param {string} url - Request URL
+     * @param {RequestInit} init - Fetch options
+     * @param {number | undefined} chunkIndex - Chunk index, for error details
+     * @param {Function} read - Reads the response body
+     * @returns {Promise<{ response: Response, body: T }>} The response and its body
+     */
+    private async send<T>(
+        fileId: string,
+        key: string,
+        kind: InFlightRequest['kind'],
+        url: string,
+        init: RequestInit,
+        chunkIndex: number | undefined,
+        read: (response: Response) => Promise<T>
+    ): Promise<{ response: Response; body: T }> {
         // Create AbortController for timeout/cancellation
         const controller = new AbortController();
         const record: InFlightRequest = { fileId, kind, controller };
@@ -1624,14 +1951,14 @@ export class TurboPush {
 
         try {
             let response: Response;
-            let body: unknown;
+            let body: T;
             try {
-                response = await fetch(this.config.endpoint, {
+                response = await fetch(url, {
                     ...init,
                     credentials: this.config.withCredentials ? 'include' : 'omit',
                     signal: controller.signal
                 });
-                body = await TurboPush.readJson(response);
+                body = await read(response);
             } catch (error) {
                 throw this.abortError(record, chunkIndex) || new TurboPushError(
                     (error as Error)?.message || 'Network error',
@@ -1644,39 +1971,7 @@ export class TurboPush {
                 throw aborted;
             }
 
-            const result = (body && typeof body === 'object' ? body : null) as Record<string, any> | null;
-            const serverMessage = result && typeof (result.message ?? result.error) === 'string'
-                ? (result.message ?? result.error) as string
-                : null;
-
-            // Check for HTTP errors
-            if (!response.ok) {
-                const status = response.status;
-                throw new TurboPushError(
-                    serverMessage || `HTTP ${status}${response.statusText ? ': ' + response.statusText : ''}`,
-                    {
-                        code: 'http',
-                        status,
-                        retryable: status === 408 || status === 429 || status >= 500,
-                        chunkIndex,
-                        data: result ? result.data : undefined
-                    }
-                );
-            }
-
-            // Parse and validate response
-            if (!result) {
-                throw new TurboPushError('Invalid response from server', {
-                    code: 'invalid_response', status: response.status, retryable: true, chunkIndex
-                });
-            }
-            if (!result.success) {
-                throw new TurboPushError(serverMessage || failureMessage, {
-                    code: 'server', status: response.status, retryable: false, chunkIndex, data: result.data
-                });
-            }
-
-            return result;
+            return { response, body };
         } finally {
             // Clean up timeout and abort controller
             clearTimeout(timeoutId);
@@ -1703,6 +1998,795 @@ export class TurboPush {
                 return new TurboPushError('Upload cancelled', { code: 'cancelled', retryable: false, chunkIndex });
             default:
                 return null;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // tus transport (https://tus.io/protocols/resumable-upload)
+    // ------------------------------------------------------------------
+
+    /**
+     * Asks the tus server which extensions it supports (OPTIONS request)
+     *
+     * The answer is kept for the lifetime of the instance. If the request
+     * fails, the client uses only the core protocol and creation, which every
+     * tus server that accepts uploads from browsers supports, and asks again
+     * on the next push().
+     *
+     * @private
+     * @returns {Promise<void>} Resolves when discovery has finished, successful or not
+     */
+    private async tusDiscover(): Promise<void> {
+        if (this.tusCapabilities) {
+            return;
+        }
+        try {
+            const { response } = await this.send('', 'tus:options', 'status', this.config.endpoint, {
+                method: 'OPTIONS',
+                headers: this.tusHeaders({}, false)
+            }, undefined, TurboPush.readText);
+            if (response.ok) {
+                this.tusCapabilities = {
+                    extensions: TurboPush.headerList(response, 'Tus-Extension'),
+                    maxSize: TurboPush.headerInteger(response, 'Tus-Max-Size'),
+                    checksumAlgorithms: TurboPush.headerList(response, 'Tus-Checksum-Algorithm')
+                };
+            }
+        } catch (error) {
+            // Discovery is only a hint, see above
+        }
+    }
+
+    /**
+     * Gets the server's capabilities, or the core-only defaults
+     *
+     * @private
+     */
+    private tusCaps(): TusCapabilities {
+        return this.tusCapabilities || { extensions: [], maxSize: null, checksumAlgorithms: [] };
+    }
+
+    /**
+     * Plans the tus uploads of a file and creates its chunks
+     *
+     * With the concatenation extension (and tus.parallel), the file is split
+     * into up to maxConcurrentUploads partial uploads of consecutive chunks,
+     * uploaded side by side and joined at the end. Otherwise the file is one
+     * upload whose chunks are sent in order. A restored file keeps its saved
+     * plan.
+     *
+     * @private
+     * @param {FileEntry} entry - The file
+     * @returns {ChunkInfo[]} The chunks, aligned to the uploads
+     */
+    private tusPlan(entry: FileEntry): ChunkInfo[] {
+        const size = entry.file.size;
+        if (!entry.tus) {
+            const chunkCount = Math.max(1, Math.ceil(size / entry.chunkSize));
+            const parallel = this.config.tus.parallel
+                && this.tusCaps().extensions.includes('concatenation')
+                && chunkCount > 1
+                && this.config.maxConcurrentUploads > 1;
+            const laneCount = parallel ? Math.min(this.config.maxConcurrentUploads, chunkCount) : 1;
+            const lanes: TusLane[] = [];
+            for (let lane = 0; lane < laneCount; lane++) {
+                const first = Math.floor(lane * chunkCount / laneCount);
+                const last = Math.floor((lane + 1) * chunkCount / laneCount);
+                lanes.push(TurboPush.newLane(null, first * entry.chunkSize, Math.min(last * entry.chunkSize, size)));
+            }
+            entry.tus = { parallel, lanes, finalUrl: null, metadata: '' };
+        }
+        entry.tus.metadata = this.tusMetadata(entry.file);
+        return this.createChunks(entry.file, entry.chunkSize, entry.tus.lanes);
+    }
+
+    /**
+     * Uploads one chunk of a tus upload
+     *
+     * Creates the upload first if needed, and asks the server for its offset
+     * (HEAD) after anything that may have left it unsure, such as a failed or
+     * aborted PATCH. If the server stored only part of a PATCH body, the rest
+     * is sent from the offset it reports.
+     *
+     * @private
+     * @param {FileEntry} entry - The file
+     * @param {ChunkInfo} chunk - The chunk
+     * @returns {Promise<void>} Resolves once the server has every byte of the chunk
+     * @throws {TurboPushError|PausedSignal|RequeueSignal} If the upload fails, is paused or must wait
+     */
+    private async tusUploadChunk(entry: FileEntry, chunk: ChunkInfo): Promise<void> {
+        const lane = entry.tus!.lanes[chunk.lane];
+        const key = `${entry.progress.fileId}:${chunk.index}`;
+
+        while (chunk.state !== 'done') {
+            this.tusCheckActive(entry, chunk);
+            if (lane.url === null) {
+                await this.tusCreate(entry, chunk, key);
+            } else if (!lane.synced) {
+                await this.tusSync(entry, chunk, key);
+            } else {
+                await this.tusPatch(entry, chunk, key);
+            }
+        }
+    }
+
+    /**
+     * Stops a tus chunk between requests if it was paused, cancelled or its file failed
+     *
+     * @private
+     */
+    private tusCheckActive(entry: FileEntry, chunk: ChunkInfo): void {
+        if (this.entries.get(entry.progress.fileId) !== entry || entry.progress.status === 'failed') {
+            throw new TurboPushError('Upload cancelled', { code: 'cancelled', retryable: false, chunkIndex: chunk.index });
+        }
+        if (this.isPaused) {
+            throw new PausedSignal('Paused');
+        }
+    }
+
+    /**
+     * Creates the tus upload for a chunk's lane (POST)
+     *
+     * @private
+     */
+    private async tusCreate(entry: FileEntry, chunk: ChunkInfo, key: string): Promise<void> {
+        const tus = entry.tus!;
+        const lane = tus.lanes[chunk.lane];
+
+        const maxSize = this.tusCaps().maxSize;
+        if (maxSize !== null && entry.file.size > maxSize) {
+            throw new TurboPushError(`File exceeds the server's maximum upload size of ${maxSize} bytes`, {
+                code: 'http', status: 413, retryable: false, chunkIndex: chunk.index
+            });
+        }
+
+        const headers: Record<string, string> = { 'Upload-Length': String(lane.end - lane.start) };
+        if (tus.metadata) {
+            headers['Upload-Metadata'] = tus.metadata;
+        }
+        if (tus.parallel) {
+            headers['Upload-Concat'] = 'partial';
+        }
+
+        const { response, body } = await this.send(entry.progress.fileId, key, 'chunk', this.config.endpoint, {
+            method: 'POST',
+            headers: this.tusHeaders(headers)
+        }, chunk.index, TurboPush.readText);
+
+        if (!response.ok) {
+            throw TurboPush.tusError(response, body, chunk.index, TurboPush.tusRetryable(response.status, false));
+        }
+        lane.url = this.tusLocation(response, chunk.index);
+        lane.synced = true;
+        this.tusSave(entry);
+        this.tusRealign(entry, chunk, lane.start);
+    }
+
+    /**
+     * Asks the server for a lane's offset (HEAD) and continues from there
+     * If the upload is gone, the lane starts again with a new upload
+     *
+     * @private
+     */
+    private async tusSync(entry: FileEntry, chunk: ChunkInfo, key: string): Promise<void> {
+        const lane = entry.tus!.lanes[chunk.lane];
+        const position = await this.tusHead(entry, lane, key, 'chunk', chunk.index);
+
+        // The server lost the upload, or data the client counted as stored
+        if (position === null || position < chunk.start) {
+            lane.recoveries++;
+            if (lane.recoveries > TUS_MAX_RECOVERIES) {
+                throw new TurboPushError('The server keeps losing the upload', {
+                    code: 'server', retryable: false, chunkIndex: chunk.index
+                });
+            }
+        }
+
+        if (position === null) {
+            lane.url = null;
+            this.tusSave(entry);
+            this.tusRealign(entry, chunk, lane.start);
+            return;
+        }
+
+        lane.synced = true;
+        this.tusRealign(entry, chunk, position);
+    }
+
+    /**
+     * Sends a chunk's remaining bytes (PATCH)
+     *
+     * @private
+     */
+    private async tusPatch(entry: FileEntry, chunk: ChunkInfo, key: string): Promise<void> {
+        const lane = entry.tus!.lanes[chunk.lane];
+        const start = chunk.start;
+        const headers: Record<string, string> = {
+            'Upload-Offset': String(start - lane.start),
+            'Content-Type': 'application/offset+octet-stream'
+        };
+        const checksum = await this.tusChecksum(chunk.blob);
+        if (checksum) {
+            headers['Upload-Checksum'] = checksum;
+        }
+        this.tusCheckActive(entry, chunk);
+
+        try {
+            const { response, body } = await this.send(entry.progress.fileId, key, 'chunk', lane.url!, {
+                method: 'PATCH',
+                headers: this.tusHeaders(headers),
+                body: chunk.blob
+            }, chunk.index, TurboPush.readText);
+
+            if (!response.ok) {
+                throw TurboPush.tusError(response, body, chunk.index, TurboPush.tusRetryable(response.status, true));
+            }
+
+            const offset = TurboPush.headerInteger(response, 'Upload-Offset');
+            const position = offset === null ? -1 : lane.start + offset;
+            if (position <= start || position > chunk.end) {
+                throw new TurboPushError('Invalid response from tus server: unexpected Upload-Offset', {
+                    code: 'invalid_response', status: response.status, retryable: true, chunkIndex: chunk.index
+                });
+            }
+            this.tusApplyOffset(entry, chunk.lane, position, chunk);
+        } catch (error) {
+            // The server may hold part of the body: ask for its offset before sending more
+            lane.synced = false;
+            throw error;
+        }
+    }
+
+    /**
+     * Gets a lane's position from the server (HEAD)
+     *
+     * @private
+     * @returns {Promise<number | null>} Position in the file up to which the
+     *   server has the lane's bytes, or null if the upload no longer exists
+     */
+    private async tusHead(
+        entry: FileEntry,
+        lane: TusLane,
+        key: string,
+        kind: InFlightRequest['kind'],
+        chunkIndex: number | undefined
+    ): Promise<number | null> {
+        const { response, body } = await this.send(entry.progress.fileId, key, kind, lane.url!, {
+            method: 'HEAD',
+            headers: this.tusHeaders({})
+        }, chunkIndex, TurboPush.readText);
+
+        const status = response.status;
+        if (status === 403 || status === 404 || status === 410) {
+            return null;
+        }
+        if (!response.ok) {
+            throw TurboPush.tusError(response, body, chunkIndex, TurboPush.tusRetryable(status, false));
+        }
+
+        const length = TurboPush.headerInteger(response, 'Upload-Length');
+        if (length !== null && length !== lane.end - lane.start) {
+            return null; // Not the upload the client created for this range
+        }
+        const offset = TurboPush.headerInteger(response, 'Upload-Offset');
+        if (offset === null || offset > lane.end - lane.start) {
+            throw new TurboPushError('Invalid response from tus server: missing or invalid Upload-Offset', {
+                code: 'invalid_response', status, retryable: true, chunkIndex
+            });
+        }
+        return lane.start + offset;
+    }
+
+    /**
+     * Applies a lane's position and makes the chunk wait if an earlier
+     * chunk of the lane has to be sent again first
+     *
+     * @private
+     */
+    private tusRealign(entry: FileEntry, chunk: ChunkInfo, position: number): void {
+        this.tusApplyOffset(entry, chunk.lane, position, chunk);
+        if (position < chunk.origin) {
+            throw new RequeueSignal('Requeue');
+        }
+    }
+
+    /**
+     * Brings a lane's chunks and the progress in line with the server's offset
+     *
+     * Chunks before the position are done, the chunk containing it continues
+     * from there, and later ones are sent in full. Works in both directions,
+     * so it also handles a server that lost data.
+     *
+     * @private
+     * @param {FileEntry} entry - The file
+     * @param {number} laneIndex - The lane
+     * @param {number} position - Position in the file up to which the server has the lane's bytes
+     * @param {ChunkInfo | null} current - The chunk whose request is running; it stays 'uploading' unless done
+     */
+    private tusApplyOffset(entry: FileEntry, laneIndex: number, position: number, current: ChunkInfo | null): void {
+        for (const chunk of entry.chunks!) {
+            if (chunk.lane !== laneIndex) {
+                continue;
+            }
+            // Bytes of the chunk counted in the progress so far
+            const counted = chunk.state === 'done' ? chunk.end - chunk.origin : chunk.start - chunk.origin;
+            const done = chunk.end <= position;
+            const start = done ? chunk.start : Math.max(chunk.origin, position);
+            const stored = done ? chunk.end - chunk.origin : start - chunk.origin;
+            if (stored !== counted) {
+                this.addUploadedBytes(entry, stored - counted);
+            }
+
+            if (done) {
+                chunk.state = 'done';
+                continue;
+            }
+            if (chunk.start !== start) {
+                chunk.start = start;
+                chunk.blob = entry.file.slice(start, chunk.end);
+            }
+            if (chunk.state === 'done' || (chunk.state === 'uploading' && chunk !== current)) {
+                chunk.state = 'pending';
+            }
+        }
+    }
+
+    /**
+     * Completes a tus file: joins the partial uploads (concatenation) or,
+     * for a single upload, simply reports its URL
+     *
+     * @private
+     * @returns {Promise<UploadResult>} The upload URL, file name and size
+     */
+    private async tusFinalize(entry: FileEntry): Promise<UploadResult> {
+        const tus = entry.tus!;
+        const fileId = entry.progress.fileId;
+
+        if (tus.parallel && tus.finalUrl === null) {
+            const headers: Record<string, string> = {
+                'Upload-Concat': 'final;' + tus.lanes.map(lane => lane.url).join(' ')
+            };
+            if (tus.metadata) {
+                headers['Upload-Metadata'] = tus.metadata;
+            }
+            const { response, body } = await this.send(fileId, `${fileId}:finalize`, 'finalize', this.config.endpoint, {
+                method: 'POST',
+                headers: this.tusHeaders(headers)
+            }, undefined, TurboPush.readText);
+
+            if (!response.ok) {
+                throw TurboPush.tusError(response, body, undefined, TurboPush.tusRetryable(response.status, false));
+            }
+            tus.finalUrl = this.tusLocation(response, undefined);
+        }
+
+        return {
+            uploadUrl: (tus.parallel ? tus.finalUrl : tus.lanes[0].url) || undefined,
+            fileName: entry.file.name,
+            fileSize: entry.file.size
+        };
+    }
+
+    /**
+     * Asks the server for its offsets of a file restored from storage
+     *
+     * Lanes the server still has continue from their offset; lanes it no
+     * longer has start again. If a request fails, the lane is checked again
+     * before its next chunk.
+     *
+     * @private
+     */
+    private async tusRestore(session: Session, entry: FileEntry): Promise<void> {
+        const tus = entry.tus!;
+        if (!entry.restored || entry.started) {
+            return;
+        }
+        const fileId = entry.progress.fileId;
+
+        await Promise.all(tus.lanes.map(async (lane, laneIndex) => {
+            if (lane.url === null) {
+                return;
+            }
+            let position: number | null;
+            try {
+                position = await this.tusHead(entry, lane, `${fileId}:status:${laneIndex}`, 'status', undefined);
+            } catch (error) {
+                return;
+            }
+            if (session.cancelled || this.entries.get(fileId) !== entry) {
+                return;
+            }
+            if (position === null) {
+                lane.url = null;
+                return;
+            }
+            lane.synced = true;
+            this.tusApplyOffset(entry, laneIndex, position, null);
+        }));
+
+        if (session.cancelled || this.entries.get(fileId) !== entry) {
+            return;
+        }
+        entry.started = tus.lanes.some(lane => lane.url !== null);
+        this.tusSave(entry);
+        this.emitProgress();
+    }
+
+    /**
+     * Forgets a file's tus uploads so the next push() starts it from scratch
+     *
+     * @private
+     */
+    private tusReset(entry: FileEntry): void {
+        this.addUploadedBytes(entry, -entry.progress.uploadedSize);
+        this.storageRemove(entry);
+        entry.tus = null;
+        entry.chunks = null;
+        entry.started = false;
+        entry.restored = false;
+    }
+
+    /**
+     * Deletes a file's tus uploads (best effort), if the server supports termination
+     *
+     * @private
+     */
+    private tusTerminate(entry: FileEntry): void {
+        if (!this.tusCaps().extensions.includes('termination')) {
+            return;
+        }
+        const tus = entry.tus!;
+        const urls = tus.lanes.map(lane => lane.url).concat(tus.finalUrl);
+        for (const url of urls) {
+            if (url === null) {
+                continue;
+            }
+            try {
+                fetch(url, {
+                    method: 'DELETE',
+                    headers: this.tusHeaders({}),
+                    credentials: this.config.withCredentials ? 'include' : 'omit',
+                    keepalive: true
+                }).catch(() => undefined);
+            } catch (error) {
+                // Unfinished uploads also expire on the server
+            }
+        }
+    }
+
+    /**
+     * Saves a file's tus upload URLs in resumable mode
+     * Leaves the slot alone if another upload of the same file owns it
+     *
+     * @private
+     */
+    private tusSave(entry: FileEntry): void {
+        if (!this.config.resumable || !entry.tus) {
+            return;
+        }
+        const key = this.storageKey(entry.file);
+        const fileId = entry.progress.fileId;
+        const owner = this.storageOwner(this.storageGet(key));
+        if (owner !== null && owner !== fileId) {
+            return;
+        }
+        if (entry.tus.lanes.every(lane => lane.url === null)) {
+            this.storageRemove(entry);
+            return;
+        }
+        const saved: SavedTusUpload = {
+            v: 1,
+            fileId,
+            parallel: entry.tus.parallel,
+            lanes: entry.tus.lanes.map(lane => ({ url: lane.url, start: lane.start, end: lane.end }))
+        };
+        this.storageSet(key, JSON.stringify(saved));
+    }
+
+    /**
+     * Builds the Upload-Metadata header value for a file
+     *
+     * @private
+     */
+    private tusMetadata(file: File): string {
+        const fields: Record<string, string> = { filename: file.name };
+        if (file.type) {
+            fields.filetype = file.type;
+        }
+
+        const option = this.config.tus.metadata;
+        let custom: unknown = option;
+        if (typeof option === 'function') {
+            try {
+                custom = option(file);
+            } catch (error) {
+                TurboPush.rethrowLater(error);
+                custom = undefined;
+            }
+        }
+        if (custom && typeof custom === 'object') {
+            for (const [key, value] of Object.entries(custom as Record<string, unknown>)) {
+                if (TUS_METADATA_KEY.test(key)) {
+                    fields[key] = String(value);
+                } else {
+                    TurboPush.rethrowLater(new Error(`TurboPush: invalid tus metadata key "${key}"`));
+                }
+            }
+        }
+
+        return Object.entries(fields)
+            .map(([key, value]) => value === '' ? key : `${key} ${TurboPush.base64Utf8(value)}`)
+            .join(',');
+    }
+
+    /**
+     * Computes the Upload-Checksum header for a chunk, if the server and the
+     * browser both support a common algorithm
+     *
+     * @private
+     * @returns {Promise<string | null>} The header value, or null to send no checksum
+     */
+    private async tusChecksum(blob: Blob): Promise<string | null> {
+        const caps = this.tusCaps();
+        const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle;
+        if (!this.config.tus.checksum || !caps.extensions.includes('checksum') || !subtle) {
+            return null;
+        }
+        const algorithm = TUS_CHECKSUMS.find(([name]) => caps.checksumAlgorithms.includes(name));
+        if (!algorithm) {
+            return null;
+        }
+        try {
+            const digest = await subtle.digest(algorithm[1], await TurboPush.readBlob(blob));
+            return `${algorithm[0]} ${TurboPush.base64(new Uint8Array(digest))}`;
+        } catch (error) {
+            return null; // Checksums are optional: send the chunk without one
+        }
+    }
+
+    /**
+     * Builds the headers of a tus request: the configured headers (without
+     * Content-Type), Tus-Resumable and the given ones
+     *
+     * @private
+     */
+    private tusHeaders(extra: Record<string, string>, version: boolean = true): Record<string, string> {
+        const headers: Record<string, string> = {};
+        for (const [name, value] of Object.entries(this.config.headers)) {
+            if (name.toLowerCase() !== 'content-type') {
+                headers[name] = value;
+            }
+        }
+        if (version) {
+            headers['Tus-Resumable'] = TUS_VERSION;
+        }
+        return Object.assign(headers, extra);
+    }
+
+    /**
+     * Reads the upload URL from a creation response, resolved against the endpoint
+     *
+     * @private
+     */
+    private tusLocation(response: Response, chunkIndex: number | undefined): string {
+        const location = TurboPush.header(response, 'Location');
+        if (!location) {
+            throw new TurboPushError(
+                'The tus server did not return an upload URL (Location header). '
+                + 'A server on another origin must list Location in Access-Control-Expose-Headers',
+                { code: 'invalid_response', status: response.status, retryable: false, chunkIndex }
+            );
+        }
+        try {
+            const page = (globalThis as { location?: { href?: string } }).location?.href;
+            const base = page ? new URL(this.config.endpoint, page).href : this.config.endpoint;
+            return new URL(location, base).href;
+        } catch (error) {
+            return location;
+        }
+    }
+
+    /**
+     * Gets the chunks that may start now: per lane, the first unfinished
+     * chunk, if no chunk of that lane is in flight
+     *
+     * @private
+     */
+    private static tusStartable(chunks: ChunkInfo[]): Set<number> {
+        const busy = new Set<number>();
+        for (const chunk of chunks) {
+            if (chunk.state === 'uploading') {
+                busy.add(chunk.lane);
+            }
+        }
+        const startable = new Set<number>();
+        const seen = new Set<number>();
+        for (const chunk of chunks) {
+            if (chunk.state === 'done' || seen.has(chunk.lane)) {
+                continue;
+            }
+            seen.add(chunk.lane);
+            if (chunk.state === 'pending' && !busy.has(chunk.lane)) {
+                startable.add(chunk.index);
+            }
+        }
+        return startable;
+    }
+
+    /**
+     * Whether a tus error status is worth retrying
+     * PATCH failures are also retried on 404/410 (the next attempt checks the
+     * upload and recreates it if it is gone), 409 (offset mismatch, the next
+     * attempt asks for the offset) and 460 (checksum mismatch)
+     *
+     * @private
+     */
+    private static tusRetryable(status: number, patch: boolean): boolean {
+        if (status === 408 || status === 423 || status === 429 || status >= 500) {
+            return true;
+        }
+        return patch && (status === 404 || status === 409 || status === 410 || status === 460);
+    }
+
+    /**
+     * Builds the error for a tus error response
+     * tus servers answer errors with a short text (tusd) or JSON body
+     *
+     * @private
+     */
+    private static tusError(response: Response, text: string, chunkIndex: number | undefined, retryable: boolean): TurboPushError {
+        const status = response.status;
+        let message = text.trim();
+        if (message.charAt(0) === '{') {
+            try {
+                const json = JSON.parse(message);
+                const value = json && (json.message ?? json.error);
+                message = typeof value === 'string' ? value : '';
+            } catch (error) {
+                message = '';
+            }
+        } else if (message.charAt(0) === '<' || message.length > 300) {
+            message = '';
+        }
+        return new TurboPushError(
+            message || `HTTP ${status}${response.statusText ? ': ' + response.statusText : ''}`,
+            { code: 'http', status, retryable, chunkIndex }
+        );
+    }
+
+    /**
+     * Creates a tus lane
+     *
+     * @private
+     */
+    private static newLane(url: string | null, start: number, end: number): TusLane {
+        return { url, start, end, synced: false, recoveries: 0 };
+    }
+
+    /**
+     * Parses and checks a saved tus upload
+     * Returns null unless it is well formed and its lanes cover the whole file
+     *
+     * @private
+     */
+    private static parseSavedTus(value: string | null, size: number): SavedTusUpload | null {
+        if (value === null) {
+            return null;
+        }
+        let saved: any;
+        try {
+            saved = JSON.parse(value);
+        } catch (error) {
+            return null;
+        }
+        if (!saved || saved.v !== 1 || typeof saved.fileId !== 'string' || !UPLOAD_ID_PATTERN.test(saved.fileId)
+            || typeof saved.parallel !== 'boolean' || !Array.isArray(saved.lanes)
+            || saved.lanes.length < 1 || saved.lanes.length > 10 || (!saved.parallel && saved.lanes.length !== 1)) {
+            return null;
+        }
+        let expected = 0;
+        for (const lane of saved.lanes) {
+            const urlValid = lane && (lane.url === null || (typeof lane.url === 'string' && /^https?:\/\//i.test(lane.url)
+                && lane.url.length <= 2048));
+            if (!urlValid || !Number.isSafeInteger(lane.start) || !Number.isSafeInteger(lane.end)
+                || lane.start !== expected || lane.end < lane.start || (lane.end === lane.start && size > 0)) {
+                return null;
+            }
+            expected = lane.end;
+        }
+        return expected === size ? saved as SavedTusUpload : null;
+    }
+
+    /**
+     * Gets a response header, tolerating responses without headers
+     *
+     * @private
+     */
+    private static header(response: Response, name: string): string | null {
+        const headers = response && response.headers;
+        return headers && typeof headers.get === 'function' ? headers.get(name) : null;
+    }
+
+    /**
+     * Gets a response header as a non-negative safe integer, or null
+     *
+     * @private
+     */
+    private static headerInteger(response: Response, name: string): number | null {
+        const value = TurboPush.header(response, name);
+        if (value === null || !/^\s*[0-9]{1,16}\s*$/.test(value)) {
+            return null;
+        }
+        const number = Number(value.trim());
+        return Number.isSafeInteger(number) ? number : null;
+    }
+
+    /**
+     * Gets a comma-separated response header as a lowercased list
+     *
+     * @private
+     */
+    private static headerList(response: Response, name: string): string[] {
+        const value = TurboPush.header(response, name);
+        return value ? value.split(',').map(part => part.trim().toLowerCase()).filter(part => part !== '') : [];
+    }
+
+    /**
+     * Base64-encodes a string's UTF-8 bytes
+     *
+     * @private
+     */
+    private static base64Utf8(value: string): string {
+        // Replace lone surrogates, which encodeURIComponent rejects
+        const wellFormed = value.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+        const binary = encodeURIComponent(wellFormed)
+            .replace(/%([0-9A-F]{2})/g, (match, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+        return btoa(binary);
+    }
+
+    /**
+     * Base64-encodes bytes
+     *
+     * @private
+     */
+    private static base64(bytes: Uint8Array): string {
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
+
+    /**
+     * Reads a Blob into an ArrayBuffer
+     *
+     * @private
+     */
+    private static readBlob(blob: Blob): Promise<ArrayBuffer> {
+        if (typeof blob.arrayBuffer === 'function') {
+            return blob.arrayBuffer();
+        }
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as ArrayBuffer);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsArrayBuffer(blob);
+        });
+    }
+
+    /**
+     * Reads a response body as text, returning '' if it cannot be read
+     *
+     * @private
+     */
+    private static async readText(response: Response): Promise<string> {
+        if (!response || typeof response.text !== 'function') {
+            return '';
+        }
+        try {
+            return await response.text();
+        } catch (error) {
+            return '';
         }
     }
 
@@ -1786,32 +2870,42 @@ export class TurboPush {
 
     /**
      * Splits a file into chunks for uploading
-     * Creates chunk metadata including blob slices. An empty file gets
-     * one empty chunk.
+     * Creates chunk metadata including blob slices. Each range (a tus
+     * upload, or the whole file) is cut into chunks of chunkSize bytes; an
+     * empty range gets one empty chunk.
      *
      * @private
      * @param {File} file - File to split into chunks
      * @param {number} chunkSize - Chunk size in bytes
+     * @param {Array} [ranges] - Byte ranges to split, one per lane (default: the whole file)
      * @returns {ChunkInfo[]} Array of chunk metadata
      */
-    private createChunks(file: File, chunkSize: number): ChunkInfo[] {
+    private createChunks(
+        file: File,
+        chunkSize: number,
+        ranges: { start: number; end: number }[] = [{ start: 0, end: file.size }]
+    ): ChunkInfo[] {
         const chunks: ChunkInfo[] = [];
-        const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
 
-        for (let i = 0; i < totalChunks; i++) {
-            const start = i * chunkSize;
-            const end = Math.min(start + chunkSize, file.size);
+        ranges.forEach((range, lane) => {
+            let start = range.start;
+            do {
+                const end = Math.min(start + chunkSize, range.end);
+                chunks.push({
+                    index: chunks.length,
+                    start,
+                    end,
+                    origin: start,
+                    lane,
+                    blob: file.slice(start, end),
+                    attempts: 0,
+                    state: 'pending',
+                    token: 0
+                });
+                start = end;
+            } while (start < range.end);
+        });
 
-            chunks.push({
-                index: i,
-                start,
-                end,
-                blob: file.slice(start, end),
-                attempts: 0,
-                state: 'pending',
-                token: 0
-            });
-        }
         return chunks;
     }
 
@@ -1868,7 +2962,8 @@ export class TurboPush {
      * @private
      */
     private storageKey(file: File): string {
-        return `turbopush:${this.config.endpoint}:${file.name}:${file.size}:${file.lastModified || 0}`;
+        const prefix = this.config.protocol === 'tus' ? 'turbopush:tus:' : 'turbopush:';
+        return `${prefix}${this.config.endpoint}:${file.name}:${file.size}:${file.lastModified || 0}`;
     }
 
     /**
@@ -1910,11 +3005,29 @@ export class TurboPush {
         }
         const key = this.storageKey(entry.file);
         try {
-            if (typeof localStorage !== 'undefined' && localStorage.getItem(key) === entry.progress.fileId) {
+            if (typeof localStorage !== 'undefined' && this.storageOwner(localStorage.getItem(key)) === entry.progress.fileId) {
                 localStorage.removeItem(key);
             }
         } catch (error) {
             // Ignore storage errors
+        }
+    }
+
+    /**
+     * Gets the upload ID a stored value belongs to
+     * The TurboPush protocol stores the ID itself, tus a JSON object with it
+     *
+     * @private
+     */
+    private storageOwner(value: string | null): string | null {
+        if (value === null || this.config.protocol !== 'tus') {
+            return value;
+        }
+        try {
+            const parsed = JSON.parse(value);
+            return parsed && typeof parsed.fileId === 'string' ? parsed.fileId : null;
+        } catch (error) {
+            return null;
         }
     }
 
@@ -1928,8 +3041,18 @@ export class TurboPush {
         try {
             callback();
         } catch (error) {
-            setTimeout(() => { throw error; }, 0);
+            TurboPush.rethrowLater(error);
         }
+    }
+
+    /**
+     * Rethrows an error asynchronously, so it shows up in the console
+     * without breaking the upload
+     *
+     * @private
+     */
+    private static rethrowLater(error: unknown): void {
+        setTimeout(() => { throw error; }, 0);
     }
 
     /**
@@ -2007,5 +3130,7 @@ export type {
     UploadResult,
     RetryInfo,
     TurboPushErrorCode,
-    TurboPushErrorOptions
+    TurboPushErrorOptions,
+    TurboPushProtocol,
+    TusOptions
 };
