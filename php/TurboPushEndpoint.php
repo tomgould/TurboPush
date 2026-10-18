@@ -14,8 +14,11 @@ namespace TurboPush;
  * - Strict validation of upload IDs, chunk indexes, counts and sizes
  * - Filename sanitisation, extension allowlist and a default blocklist
  *   of server-executable extensions
- * - Temporary chunks kept outside the web root by default
- * - CORS support
+ * - Optional MIME type allowlist and custom validation hook
+ * - Temporary chunks kept outside the web root by default, with automatic
+ *   cleanup of abandoned uploads
+ * - Status and abort actions for resuming and cancelling uploads
+ * - Configurable CORS
  * - Optional logging
  *
  * @package    TurboPush
@@ -119,6 +122,42 @@ class TurboPushEndpoint
         'cgi', 'pl', 'asp', 'aspx', 'ashx', 'asmx', 'jsp', 'jspx', 'shtml', 'shtm',
         'htaccess', 'htpasswd',
     ];
+
+    /**
+     * Allowed MIME types, detected from file contents (empty array = not checked)
+     * @var array
+     */
+    private $allowedMimeTypes = [];
+
+    /**
+     * Custom validator called with the assembled file before it is stored
+     * @var callable|null
+     */
+    private $fileValidator = null;
+
+    /**
+     * Callback called after a file has been stored
+     * @var callable|null
+     */
+    private $completeCallback = null;
+
+    /**
+     * Seconds after the last activity before an upload's chunks are removed (default: 24 hours)
+     * @var int
+     */
+    private $uploadTtl = 86400;
+
+    /**
+     * Probability (0-1) that a request also runs cleanup() (default: 0.01)
+     * @var float
+     */
+    private $cleanupProbability = 0.01;
+
+    /**
+     * Origins allowed to call the endpoint cross-origin (['*'] = any, [] = no CORS headers)
+     * @var array
+     */
+    private $allowedOrigins = ['*'];
 
     /**
      * Path to log file (null = logging disabled)
@@ -234,6 +273,142 @@ class TurboPushEndpoint
     }
 
     /**
+     * Sets allowed MIME types
+     *
+     * The type is detected from the assembled file's contents with the
+     * fileinfo extension, not taken from the client. Wildcards such as
+     * 'image/*' are supported. Empty array disables the check.
+     *
+     * @param array $mimeTypes Allowed MIME types (e.g., ['image/png', 'image/*'])
+     * @return $this Fluent interface for method chaining
+     * @throws \RuntimeException If the fileinfo extension is not available
+     *
+     * @example
+     * ```php
+     * $endpoint->setAllowedMimeTypes(['image/jpeg', 'image/png', 'application/pdf']);
+     * ```
+     */
+    public function setAllowedMimeTypes($mimeTypes) {
+        $normalized = [];
+        foreach ((array) $mimeTypes as $mimeType) {
+            $mimeType = strtolower(trim((string) $mimeType));
+            if ($mimeType !== '') {
+                $normalized[] = $mimeType;
+            }
+        }
+
+        if (!empty($normalized) && !class_exists('finfo')) {
+            throw new \RuntimeException('setAllowedMimeTypes() requires the fileinfo extension');
+        }
+
+        $this->allowedMimeTypes = $normalized;
+        return $this;
+    }
+
+    /**
+     * Sets a custom validator for assembled files
+     *
+     * Called with the path of the assembled (not yet stored) file and an info
+     * array with fileId, fileName, fileSize and mimeType. Return false to
+     * reject the file with 415, or throw a TurboPushException to choose the
+     * message and status code. Useful for virus scans or image checks.
+     *
+     * @param callable|null $validator function (string $path, array $info): bool|void
+     * @return $this Fluent interface for method chaining
+     *
+     * @example
+     * ```php
+     * $endpoint->setFileValidator(function ($path, $info) {
+     *     return getimagesize($path) !== false;
+     * });
+     * ```
+     */
+    public function setFileValidator($validator) {
+        $this->fileValidator = $validator;
+        return $this;
+    }
+
+    /**
+     * Registers a callback for stored files
+     *
+     * Called with the final path and an info array with fileId, fileName
+     * (the stored name), originalName, fileSize and mimeType. Return an array
+     * to add fields to the response data. If the callback throws, the stored
+     * file is removed and the chunks are kept so the client can retry.
+     *
+     * @param callable|null $callback function (string $path, array $info): array|void
+     * @return $this Fluent interface for method chaining
+     *
+     * @example
+     * ```php
+     * $endpoint->onComplete(function ($path, $info) use ($db) {
+     *     return ['id' => $db->insertUpload($path, $info['fileSize'])];
+     * });
+     * ```
+     */
+    public function onComplete($callback) {
+        $this->completeCallback = $callback;
+        return $this;
+    }
+
+    /**
+     * Sets how long abandoned uploads are kept
+     *
+     * Chunks of uploads with no activity for this long are removed by
+     * cleanup(). Completed uploads keep a small marker for the same time so
+     * repeated finalize requests are answered correctly.
+     *
+     * @param int $seconds Time since the last activity (default: 86400)
+     * @return $this Fluent interface for method chaining
+     */
+    public function setUploadTtl($seconds) {
+        $this->uploadTtl = max(0, (int) $seconds);
+        return $this;
+    }
+
+    /**
+     * Sets the probability that a request also runs cleanup()
+     *
+     * Works like PHP's session garbage collection. Set to 0 and call
+     * cleanup() from cron instead if you prefer.
+     *
+     * @param float $probability Between 0 (never) and 1 (every request), default 0.01
+     * @return $this Fluent interface for method chaining
+     */
+    public function setCleanupProbability($probability) {
+        $this->cleanupProbability = min(1.0, max(0.0, (float) $probability));
+        return $this;
+    }
+
+    /**
+     * Sets the origins allowed to call the endpoint cross-origin
+     *
+     * ['*'] (the default) allows any origin without credentials. A list of
+     * origins allows only those, with credentials, and rejects requests from
+     * other origins with 403 (same-origin requests are always allowed). An
+     * empty array sends no CORS headers at all.
+     *
+     * @param array $origins Origins such as ['https://app.example.com']
+     * @return $this Fluent interface for method chaining
+     *
+     * @example
+     * ```php
+     * $endpoint->setAllowedOrigins(['https://app.example.com']);
+     * ```
+     */
+    public function setAllowedOrigins($origins) {
+        $normalized = [];
+        foreach ((array) $origins as $origin) {
+            $origin = rtrim(trim((string) $origin), '/');
+            if ($origin !== '') {
+                $normalized[] = $origin;
+            }
+        }
+        $this->allowedOrigins = $normalized;
+        return $this;
+    }
+
+    /**
      * Enables logging to a file
      *
      * All upload activities will be logged with timestamps.
@@ -289,7 +464,7 @@ class TurboPushEndpoint
     public function processRequest(array $server, array $post, array $files, $body = '') {
         $response = $this->dispatch($server, $post, $files, $body);
 
-        $headers = $response['headers'] + $this->corsHeaders();
+        $headers = $response['headers'] + $this->corsHeaders($server);
         if ($response['body'] !== null) {
             $headers += [
                 'Content-Type' => 'application/json; charset=utf-8',
@@ -325,6 +500,12 @@ class TurboPushEndpoint
             if ($method !== 'POST') {
                 throw new TurboPushException('Method not allowed', 405);
             }
+
+            if (!$this->isOriginAllowed($server)) {
+                throw new TurboPushException('Origin not allowed', 403);
+            }
+
+            $this->maybeCleanup();
 
             // Multipart requests carry chunks
             if (!empty($files) || !empty($post)) {
@@ -372,6 +553,10 @@ class TurboPushEndpoint
         switch ($data['action']) {
             case 'finalize':
                 return $this->finalizeUpload($data);
+            case 'status':
+                return $this->uploadStatus($data);
+            case 'abort':
+                return $this->abortUpload($data);
             default:
                 throw new TurboPushException('Unknown action', 400);
         }
@@ -532,10 +717,7 @@ class TurboPushEndpoint
                 if ($done['sourceName'] !== $fileName || (int) $done['fileSize'] !== $fileSize) {
                     throw new TurboPushException('Upload metadata does not match', 409);
                 }
-                return $this->successResponse('Upload complete', [
-                    'fileName' => $done['fileName'],
-                    'fileSize' => (int) $done['fileSize']
-                ]);
+                return $this->successResponse('Upload complete', $done['data']);
             }
 
             $meta = $this->readJsonFile($fileTempDir . self::META_FILE);
@@ -572,11 +754,21 @@ class TurboPushEndpoint
             $partPath = $this->uploadDir . '.turbopush-' . bin2hex(random_bytes(8)) . '.part';
             $this->assembleChunks($fileTempDir, $totalChunks, $partPath);
 
+            $info = [
+                'fileId' => $uploadId,
+                'fileName' => $fileName,
+                'fileSize' => $fileSize,
+                'mimeType' => null,
+            ];
+
             try {
                 // Verify final file size matches expected size
                 if ($this->fileSize($partPath) !== $fileSize) {
                     throw new \RuntimeException('Assembled file size mismatch for ' . $partPath);
                 }
+
+                $info['mimeType'] = $this->validateMimeType($partPath);
+                $this->runFileValidator($partPath, $info);
 
                 $finalPath = $this->moveToFinalPath($partPath, $fileName);
             } catch (\Throwable $e) {
@@ -589,9 +781,29 @@ class TurboPushEndpoint
                 'fileSize' => $fileSize
             ];
 
+            if ($this->completeCallback !== null) {
+                try {
+                    $extra = call_user_func($this->completeCallback, $finalPath, [
+                        'fileName' => $result['fileName'],
+                        'originalName' => $fileName,
+                    ] + $info);
+                } catch (\Throwable $e) {
+                    // Keep the chunks so the client can retry the finalize request
+                    @unlink($finalPath);
+                    throw $e;
+                }
+                if (is_array($extra)) {
+                    $result += $extra;
+                }
+            }
+
             // Remember the result so repeated finalize requests are harmless,
             // then clean up the chunks
-            $this->writeJsonFile($fileTempDir . self::DONE_FILE, $result + ['sourceName' => $fileName]);
+            $this->writeJsonFile($fileTempDir . self::DONE_FILE, [
+                'sourceName' => $fileName,
+                'fileSize' => $fileSize,
+                'data' => $result,
+            ]);
             for ($i = 0; $i < $totalChunks; $i++) {
                 @unlink($fileTempDir . $this->chunkFileName($i));
             }
@@ -604,6 +816,210 @@ class TurboPushEndpoint
 
         // Return success response with file information
         return $this->successResponse('Upload complete', $result);
+    }
+
+    /**
+     * Reports which chunks of an upload the server already has
+     *
+     * Lets a client resume an interrupted upload by sending only the
+     * missing chunks.
+     *
+     * @param array $data Request data containing fileId
+     * @return array Response array
+     * @throws TurboPushException If the upload is unknown
+     *
+     * @private
+     */
+    private function uploadStatus(array $data) {
+        if (!isset($data['fileId'])) {
+            throw new TurboPushException('Missing: fileId', 400);
+        }
+        $uploadId = $this->validateUploadId($data['fileId']);
+
+        $fileTempDir = $this->uploadTempDir($uploadId);
+        if (!is_dir($fileTempDir)) {
+            throw new TurboPushException('Upload not found', 404);
+        }
+
+        $lock = $this->acquireLock($fileTempDir);
+
+        try {
+            $done = $this->readJsonFile($fileTempDir . self::DONE_FILE);
+            if ($done !== null) {
+                return $this->successResponse('Upload complete', ['complete' => true] + $done['data']);
+            }
+
+            $meta = $this->readJsonFile($fileTempDir . self::META_FILE);
+            if ($meta === null) {
+                throw new TurboPushException('Upload not found', 404);
+            }
+
+            $uploaded = [];
+            foreach (scandir($fileTempDir) ?: [] as $entry) {
+                if (preg_match('/^chunk_([0-9]{10})$/', $entry, $match)) {
+                    $uploaded[] = (int) $match[1];
+                }
+            }
+            sort($uploaded);
+
+            return $this->successResponse('Upload in progress', [
+                'complete' => false,
+                'fileName' => $meta['fileName'],
+                'fileSize' => (int) $meta['fileSize'],
+                'totalChunks' => (int) $meta['totalChunks'],
+                'receivedBytes' => (int) $meta['receivedBytes'],
+                'uploadedChunks' => $uploaded,
+            ]);
+        } finally {
+            $this->releaseLock($lock);
+        }
+    }
+
+    /**
+     * Deletes the stored chunks of an upload
+     *
+     * Called by the client when an upload is cancelled. Unknown uploads are
+     * not an error, so the request can safely be repeated.
+     *
+     * @param array $data Request data containing fileId
+     * @return array Response array
+     *
+     * @private
+     */
+    private function abortUpload(array $data) {
+        if (!isset($data['fileId'])) {
+            throw new TurboPushException('Missing: fileId', 400);
+        }
+        $uploadId = $this->validateUploadId($data['fileId']);
+
+        $fileTempDir = $this->uploadTempDir($uploadId);
+        if (is_dir($fileTempDir)) {
+            $this->removeUploadDir($fileTempDir, false);
+        }
+
+        $this->log("Aborted ($uploadId)");
+
+        return $this->successResponse('Upload aborted', []);
+    }
+
+    /**
+     * Removes abandoned uploads
+     *
+     * Deletes the temporary data of uploads with no activity for longer than
+     * the upload TTL, and leftover assembly files in the upload directory.
+     * Uploads that are being worked on (locked) are skipped. Only files
+     * TurboPush created are deleted. Call it from cron, or rely on the
+     * probabilistic cleanup (see setCleanupProbability()).
+     *
+     * @param int|null $maxAge Override the TTL in seconds
+     * @return int Number of uploads removed
+     *
+     * @since 1.1.0
+     *
+     * @example
+     * ```php
+     * // cron: php -r "require 'vendor/autoload.php'; (new TurboPush\TurboPushEndpoint('/var/uploads'))->cleanup();"
+     * $removed = $endpoint->cleanup();
+     * ```
+     */
+    public function cleanup($maxAge = null) {
+        $cutoff = time() - ($maxAge === null ? $this->uploadTtl : max(0, (int) $maxAge));
+        $removed = 0;
+
+        if (is_dir($this->tempDir)) {
+            foreach (scandir($this->tempDir) ?: [] as $entry) {
+                $dir = $this->tempDir . $entry;
+                if (!preg_match(self::UPLOAD_ID_PATTERN, $entry) || is_link($dir) || !is_dir($dir)) {
+                    continue;
+                }
+                clearstatcache(true, $dir);
+                if (filemtime($dir) >= $cutoff) {
+                    continue;
+                }
+                if ($this->removeUploadDir($dir . '/', true)) {
+                    $removed++;
+                }
+            }
+        }
+
+        // Assembly files left behind by a crashed finalize
+        foreach ((is_dir($this->uploadDir) ? scandir($this->uploadDir) : false) ?: [] as $entry) {
+            $partPath = $this->uploadDir . $entry;
+            if (!preg_match('/^\.turbopush-[0-9a-f]+\.part$/', $entry) || !is_file($partPath)) {
+                continue;
+            }
+            clearstatcache(true, $partPath);
+            if (filemtime($partPath) < $cutoff) {
+                @unlink($partPath);
+            }
+        }
+
+        if ($removed > 0) {
+            $this->log("Cleanup removed $removed abandoned upload(s)");
+        }
+
+        return $removed;
+    }
+
+    /**
+     * Runs cleanup() with the configured probability
+     *
+     * @return void
+     *
+     * @private
+     */
+    private function maybeCleanup() {
+        if ($this->cleanupProbability <= 0) {
+            return;
+        }
+        if ($this->cleanupProbability < 1 && mt_rand() / mt_getrandmax() >= $this->cleanupProbability) {
+            return;
+        }
+        try {
+            $this->cleanup();
+        } catch (\Throwable $e) {
+            $this->log('ERROR: cleanup failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Deletes an upload's temporary directory
+     *
+     * Only files TurboPush creates are deleted; the directory itself is only
+     * removed once it is empty.
+     *
+     * @param string $fileTempDir   Upload directory with trailing slash
+     * @param bool   $skipIfLocked  Skip the upload if another request holds its lock
+     * @return bool True if the directory was removed
+     *
+     * @private
+     */
+    private function removeUploadDir($fileTempDir, $skipIfLocked) {
+        $lock = @fopen($fileTempDir . self::LOCK_FILE, 'c');
+        if ($lock === false) {
+            return false;
+        }
+        if (!flock($lock, $skipIfLocked ? LOCK_EX | LOCK_NB : LOCK_EX)) {
+            fclose($lock);
+            return false;
+        }
+
+        foreach (scandir($fileTempDir) ?: [] as $entry) {
+            if ($entry === self::META_FILE
+                || $entry === self::DONE_FILE
+                || preg_match('/^chunk_[0-9]{10}(\.[0-9a-f]+\.part)?$/', $entry)
+                || preg_match('/^(upload|complete)\.json\.[0-9a-f]+\.tmp$/', $entry)) {
+                @unlink($fileTempDir . $entry);
+            }
+        }
+
+        // Unlink the lock file while holding it; waiting requests notice
+        // and stop (see acquireLock())
+        @unlink($fileTempDir . self::LOCK_FILE);
+        flock($lock, LOCK_UN);
+        fclose($lock);
+
+        return @rmdir($fileTempDir);
     }
 
     /**
@@ -890,6 +1306,54 @@ class TurboPushEndpoint
     }
 
     /**
+     * Checks the detected MIME type of a file against the allowlist
+     *
+     * @param string $path File to inspect
+     * @return string|null Detected MIME type, or null if no allowlist is set
+     * @throws TurboPushException If the type is not allowed
+     *
+     * @private
+     */
+    private function validateMimeType($path) {
+        if (empty($this->allowedMimeTypes)) {
+            return null;
+        }
+
+        $finfo = new \finfo(FILEINFO_MIME_TYPE);
+        $mimeType = strtolower((string) $finfo->file($path));
+
+        foreach ($this->allowedMimeTypes as $allowed) {
+            if ($allowed === $mimeType) {
+                return $mimeType;
+            }
+            if (substr($allowed, -2) === '/*' && strpos($mimeType, substr($allowed, 0, -1)) === 0) {
+                return $mimeType;
+            }
+        }
+
+        throw new TurboPushException('File type not allowed', 415);
+    }
+
+    /**
+     * Runs the custom file validator, if any
+     *
+     * @param string $path File to validate
+     * @param array  $info File information
+     * @return void
+     * @throws TurboPushException If the validator rejects the file
+     *
+     * @private
+     */
+    private function runFileValidator($path, array $info) {
+        if ($this->fileValidator === null) {
+            return;
+        }
+        if (call_user_func($this->fileValidator, $path, $info) === false) {
+            throw new TurboPushException('File rejected', 415);
+        }
+    }
+
+    /**
      * Assembles chunks in order into a new file
      *
      * @param string $fileTempDir Directory holding the chunks
@@ -1059,6 +1523,14 @@ class TurboPushEndpoint
             fclose($handle);
             throw new \RuntimeException('Failed to lock ' . $fileTempDir);
         }
+
+        // The upload was aborted or cleaned up while we waited for the lock
+        clearstatcache(true, $fileTempDir . self::LOCK_FILE);
+        if (!is_file($fileTempDir . self::LOCK_FILE)) {
+            $this->releaseLock($handle);
+            throw new TurboPushException('Upload was cancelled or has expired', 409);
+        }
+
         return $handle;
     }
 
@@ -1176,19 +1648,67 @@ class TurboPushEndpoint
     /**
      * Builds the CORS headers for a response
      *
-     * Allows requests from any origin (adjust for production security).
+     * See setAllowedOrigins().
      *
+     * @param array $server Server parameters
      * @return array Header name => value
      *
      * @private
      */
-    private function corsHeaders() {
-        // WARNING: Allow-Origin: * is permissive. Restrict in production.
-        return [
-            'Access-Control-Allow-Origin' => '*',
+    private function corsHeaders(array $server) {
+        if (empty($this->allowedOrigins)) {
+            return [];
+        }
+
+        $allow = [
             'Access-Control-Allow-Methods' => 'POST, OPTIONS',
-            'Access-Control-Allow-Headers' => 'Content-Type, Authorization',
+            'Access-Control-Allow-Headers' => 'Content-Type, Authorization, X-Requested-With',
+            'Access-Control-Max-Age' => '600',
         ];
+
+        if (in_array('*', $this->allowedOrigins, true)) {
+            return ['Access-Control-Allow-Origin' => '*'] + $allow;
+        }
+
+        $origin = isset($server['HTTP_ORIGIN']) ? rtrim((string) $server['HTTP_ORIGIN'], '/') : '';
+        if ($origin !== '' && in_array($origin, $this->allowedOrigins, true)) {
+            return [
+                'Access-Control-Allow-Origin' => $origin,
+                'Access-Control-Allow-Credentials' => 'true',
+                'Vary' => 'Origin',
+            ] + $allow;
+        }
+
+        return ['Vary' => 'Origin'];
+    }
+
+    /**
+     * Checks the Origin header against the allowed origins
+     *
+     * Requests without an Origin header (non-browser clients) and
+     * same-origin requests are always allowed.
+     *
+     * @param array $server Server parameters
+     * @return bool
+     *
+     * @private
+     */
+    private function isOriginAllowed(array $server) {
+        if (empty($this->allowedOrigins) || in_array('*', $this->allowedOrigins, true)) {
+            return true;
+        }
+
+        $origin = isset($server['HTTP_ORIGIN']) ? rtrim((string) $server['HTTP_ORIGIN'], '/') : '';
+        if ($origin === '' || in_array($origin, $this->allowedOrigins, true)) {
+            return true;
+        }
+
+        $host = parse_url($origin, PHP_URL_HOST);
+        $port = parse_url($origin, PHP_URL_PORT);
+        $originHost = $port ? $host . ':' . $port : $host;
+
+        return isset($server['HTTP_HOST']) && is_string($originHost)
+            && strcasecmp($originHost, (string) $server['HTTP_HOST']) === 0;
     }
 
     /**
