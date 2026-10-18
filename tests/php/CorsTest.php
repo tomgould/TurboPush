@@ -130,9 +130,54 @@ class CorsTest extends EndpointTestCase
         $this->assertSame('https://app.example', $response['headers']['Access-Control-Allow-Origin']);
         $this->assertSame('true', $response['headers']['Access-Control-Allow-Credentials']);
         $this->assertSame('POST, OPTIONS', $response['headers']['Access-Control-Allow-Methods']);
-        $this->assertStringContainsString('Content-Type', $response['headers']['Access-Control-Allow-Headers']);
+        $this->assertSame('Content-Type, Authorization, X-Requested-With', $response['headers']['Access-Control-Allow-Headers']);
         $this->assertSame('600', $response['headers']['Access-Control-Max-Age']);
-        $this->assertSame('Origin', $response['headers']['Vary']);
+        $this->assertSame('Origin, Access-Control-Request-Headers', $response['headers']['Vary']);
+    }
+
+    public function testPreflightAllowsTheRequestedHeadersForAllowedOrigins(): void {
+        // A page sending a CSRF token through the client's headers option
+        $endpoint = $this->endpoint()->setAllowedOrigins(['https://app.example']);
+        $response = $this->preflight([
+            'HTTP_ORIGIN' => 'https://app.example',
+            'HTTP_HOST' => 'upload.example',
+            'HTTP_ACCESS_CONTROL_REQUEST_HEADERS' => 'content-type, x-csrf-token,X-Tenant ,authorization',
+        ], $endpoint);
+
+        $this->assertSame(204, $response['status']);
+        $this->assertSame(
+            'Content-Type, Authorization, X-Requested-With, x-csrf-token, X-Tenant',
+            $response['headers']['Access-Control-Allow-Headers']
+        );
+    }
+
+    public function testPreflightEchoesOnlyValidHeaderNames(): void {
+        $endpoint = $this->endpoint()->setAllowedOrigins(['*']);
+        $many = implode(',', array_map(function ($i) { return 'x-h' . $i; }, range(1, 30)));
+        $response = $this->preflight([
+            'HTTP_ORIGIN' => 'https://anywhere.example',
+            'HTTP_HOST' => 'upload.example',
+            'HTTP_ACCESS_CONTROL_REQUEST_HEADERS' => "x-ok, bad header, x-\u{e9}vil, a:b, {$many}",
+        ], $endpoint);
+
+        $allowed = explode(', ', $response['headers']['Access-Control-Allow-Headers']);
+        $this->assertContains('x-ok', $allowed);
+        $this->assertNotContains('bad header', $allowed);
+        $this->assertNotContains('a:b', $allowed);
+        $this->assertCount(23, $allowed);
+        $this->assertSame('Access-Control-Request-Headers', $response['headers']['Vary']);
+    }
+
+    public function testRequestedHeadersAreNotEchoedToOtherOrigins(): void {
+        $endpoint = $this->endpoint()->setAllowedOrigins(['https://app.example']);
+        $response = $this->preflight([
+            'HTTP_ORIGIN' => 'https://evil.example',
+            'HTTP_HOST' => 'upload.example',
+            'HTTP_ACCESS_CONTROL_REQUEST_HEADERS' => 'x-csrf-token',
+        ], $endpoint);
+
+        $this->assertSame(403, $response['status']);
+        $this->assertNoCorsHeaders($response);
     }
 
     public function testRejectsOtherOrigins(): void {

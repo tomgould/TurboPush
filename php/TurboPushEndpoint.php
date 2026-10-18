@@ -1782,8 +1782,10 @@ class TurboPushEndpoint
      * Same-origin only (the default): none. ['*']: Access-Control-Allow-Origin: *
      * without credentials. A list: the matching entry with credentials, and
      * Vary: Origin on every response because the headers depend on the Origin.
-     * The header value always comes from the list, never from the request.
-     * See setAllowedOrigins().
+     * The origin header value always comes from the list, never from the request.
+     * Preflights from an allowed origin also allow the request headers the
+     * browser asks for (such as a CSRF token header), so they carry
+     * Vary: Access-Control-Request-Headers. See setAllowedOrigins().
      *
      * @param array $server Server parameters
      * @return array Header name => value
@@ -1795,14 +1797,16 @@ class TurboPushEndpoint
             return [];
         }
 
+        $preflight = isset($server['REQUEST_METHOD']) && strtoupper($server['REQUEST_METHOD']) === 'OPTIONS';
         $allow = [
             'Access-Control-Allow-Methods' => 'POST, OPTIONS',
-            'Access-Control-Allow-Headers' => 'Content-Type, Authorization, X-Requested-With',
+            'Access-Control-Allow-Headers' => $this->allowedRequestHeaders($server),
             'Access-Control-Max-Age' => '600',
         ];
 
         if (in_array('*', $this->allowedOrigins, true)) {
-            return ['Access-Control-Allow-Origin' => '*'] + $allow;
+            $vary = $preflight ? ['Vary' => 'Access-Control-Request-Headers'] : [];
+            return ['Access-Control-Allow-Origin' => '*'] + $allow + $vary;
         }
 
         $origin = $this->requestOrigin($server);
@@ -1811,11 +1815,45 @@ class TurboPushEndpoint
             return [
                 'Access-Control-Allow-Origin' => $this->allowedOrigins[$index],
                 'Access-Control-Allow-Credentials' => 'true',
-                'Vary' => 'Origin',
+                'Vary' => $preflight ? 'Origin, Access-Control-Request-Headers' : 'Origin',
             ] + $allow;
         }
 
         return ['Vary' => 'Origin'];
+    }
+
+    /**
+     * Builds Access-Control-Allow-Headers for an allowed origin
+     *
+     * Content-Type, Authorization and X-Requested-With, plus the headers the
+     * preflight asks for in Access-Control-Request-Headers, so a page can send
+     * its own headers (such as a CSRF token) through the client's `headers`
+     * option. Only syntactically valid header names are echoed, at most 20.
+     *
+     * @param array $server Server parameters
+     * @return string Header value
+     *
+     * @private
+     */
+    private function allowedRequestHeaders(array $server) {
+        $headers = ['Content-Type', 'Authorization', 'X-Requested-With'];
+        $seen = array_map('strtolower', $headers);
+        $requested = isset($server['HTTP_ACCESS_CONTROL_REQUEST_HEADERS'])
+            ? (string) $server['HTTP_ACCESS_CONTROL_REQUEST_HEADERS']
+            : '';
+
+        foreach (explode(',', $requested) as $name) {
+            $name = trim($name);
+            if (count($headers) >= 23 || !preg_match('/^[A-Za-z0-9!#$%&\'*+.^_`|~-]{1,64}$/D', $name)) {
+                continue;
+            }
+            if (!in_array(strtolower($name), $seen, true)) {
+                $headers[] = $name;
+                $seen[] = strtolower($name);
+            }
+        }
+
+        return implode(', ', $headers);
     }
 
     /**
