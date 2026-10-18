@@ -335,6 +335,9 @@ interface ChunkInfo {
 
     /** Upload state: waiting to be sent, in flight, waiting to retry, or done */
     state: 'pending' | 'uploading' | 'waiting' | 'done';
+
+    /** Incremented for every request, so a late answer to an older request is ignored */
+    token: number;
 }
 
 /**
@@ -376,7 +379,7 @@ interface Session {
     cancelledStats?: UploadStats;
     startBytes: number;
     activeChunks: number;
-    timers: Set<ReturnType<typeof setTimeout>>;
+    sleepers: Set<{ timer: ReturnType<typeof setTimeout>; wake: () => void }>;
 }
 
 /**
@@ -761,7 +764,7 @@ export class TurboPush {
             cancelled: false,
             startBytes: this.stats.uploadedBytes,
             activeChunks: 0,
-            timers: new Set()
+            sleepers: new Set()
         };
         this.session = session;
         session.promise = this.runSession(session, finished);
@@ -901,9 +904,11 @@ export class TurboPush {
 
         if (session) {
             session.cancelled = true;
-            for (const timer of session.timers) {
-                clearTimeout(timer);
+            for (const sleeper of session.sleepers) {
+                clearTimeout(sleeper.timer);
+                sleeper.wake();
             }
+            session.sleepers.clear();
             const endTime = Date.now();
             const duration = (endTime - this.stats.startTime) / 1000;
             session.cancelledStats = {
@@ -1074,13 +1079,16 @@ export class TurboPush {
         this.stats.duration = (this.stats.endTime - this.stats.startTime) / 1000;
         this.stats.averageSpeed = (this.stats.uploadedBytes - session.startBytes) / (this.stats.duration || 1);
 
+        // Take the result before the callback, which may start another push()
+        const result = this.getStats();
+
         // Notify completion callback
         if (this.completeCallback) {
             const callback = this.completeCallback;
-            TurboPush.safeCall(() => callback(this.getStats()));
+            TurboPush.safeCall(() => callback({ ...result }));
         }
 
-        return this.getStats();
+        return result;
     }
 
     /**
@@ -1106,6 +1114,10 @@ export class TurboPush {
                 continue;
             }
             for (const chunk of entry.chunks) {
+                // A callback run by startChunk() may have paused or cancelled
+                if (session.cancelled || this.isPaused || this.session !== session) {
+                    return;
+                }
                 if (session.activeChunks >= this.config.maxConcurrentUploads) {
                     return;
                 }
@@ -1127,20 +1139,30 @@ export class TurboPush {
      */
     private startChunk(session: Session, entry: FileEntry, chunk: ChunkInfo): void {
         chunk.state = 'uploading';
+        const token = ++chunk.token;
         session.activeChunks++;
+        entry.started = true;
 
         if (entry.progress.status !== 'uploading') {
             entry.progress.status = 'uploading';
             entry.lastSpeedTime = Date.now();
             entry.lastSpeedBytes = entry.progress.uploadedSize;
             this.emitProgress();
+
+            // The progress callback may have paused or cancelled
+            if (session.cancelled || this.isPaused || this.session !== session) {
+                if (chunk.token === token && chunk.state === 'uploading') {
+                    chunk.state = 'pending';
+                }
+                session.activeChunks--;
+                return;
+            }
         }
-        entry.started = true;
 
         this.uploadChunk(entry, chunk)
             .then(
                 () => this.handleChunkSuccess(session, entry, chunk),
-                (error) => this.handleChunkError(session, entry, chunk, error)
+                (error) => this.handleChunkError(session, entry, chunk, token, error)
             )
             .finally(() => {
                 session.activeChunks--;
@@ -1154,17 +1176,45 @@ export class TurboPush {
      * @private
      */
     private handleChunkSuccess(session: Session, entry: FileEntry, chunk: ChunkInfo): void {
-        if (session.cancelled || entry.progress.status === 'failed') {
-            chunk.state = 'done';
+        if (session.cancelled || this.entries.get(entry.progress.fileId) !== entry) {
             return;
         }
 
-        chunk.state = 'done';
-        this.addUploadedBytes(entry, chunk.end - chunk.start);
-        this.updateSpeed(entry);
-        this.emitProgress();
+        // The server has the chunk, even if the file failed meanwhile or this
+        // answers an older request: count it once
+        if (chunk.state !== 'done') {
+            chunk.state = 'done';
+            this.addUploadedBytes(entry, chunk.end - chunk.start);
+        }
 
-        if (entry.chunks!.every(c => c.state === 'done')) {
+        const status = entry.progress.status;
+        if (this.session === session && status !== 'failed' && status !== 'completed') {
+            this.updateSpeed(entry);
+            this.emitProgress();
+        }
+
+        this.maybeFinalize(entry);
+    }
+
+    /**
+     * Finalizes a file of the running session once all its chunks are uploaded
+     *
+     * @private
+     */
+    private maybeFinalize(entry: FileEntry): void {
+        const session = this.session;
+        const fileId = entry.progress.fileId;
+        if (!session || session.cancelled || entry.finalizing || !entry.chunks) {
+            return;
+        }
+        if (!session.fileIds.includes(fileId) || this.entries.get(fileId) !== entry) {
+            return;
+        }
+        const status = entry.progress.status;
+        if (status === 'failed' || status === 'completed') {
+            return;
+        }
+        if (entry.chunks.every(c => c.state === 'done')) {
             this.finalizeFile(session, entry);
         }
     }
@@ -1174,13 +1224,15 @@ export class TurboPush {
      *
      * @private
      */
-    private handleChunkError(session: Session, entry: FileEntry, chunk: ChunkInfo, error: unknown): void {
-        if (session.cancelled) {
+    private handleChunkError(session: Session, entry: FileEntry, chunk: ChunkInfo, token: number, error: unknown): void {
+        // Ignore answers to requests that were superseded or are no longer relevant
+        if (session.cancelled || chunk.token !== token || chunk.state === 'done') {
             return;
         }
 
-        // Aborted by pause() or because another chunk failed: send again later
-        if (error instanceof PausedSignal || entry.progress.status === 'failed') {
+        // Aborted by pause(), because another chunk failed, or after the
+        // session ended: send again later
+        if (this.session !== session || error instanceof PausedSignal || entry.progress.status === 'failed') {
             chunk.state = 'pending';
             return;
         }
@@ -1287,11 +1339,38 @@ export class TurboPush {
             }
         } catch (error) {
             if (!session.cancelled) {
-                this.failFile(session, entry, TurboPush.toTurboPushError(error));
+                const failure = TurboPush.toTurboPushError(error);
+                this.resetLostChunks(entry, failure);
+                this.failFile(session, entry, failure);
             }
         } finally {
             entry.finalizing = false;
             this.checkSessionDone(session);
+        }
+    }
+
+    /**
+     * Marks chunks as not uploaded when finalize shows the server lost them
+     * (404: the upload expired; 409: chunks missing), so push() sends them again
+     *
+     * @private
+     */
+    private resetLostChunks(entry: FileEntry, error: TurboPushError): void {
+        if (!entry.chunks || (error.status !== 404 && error.status !== 409)) {
+            return;
+        }
+
+        const missing = (error.data as { missingChunks?: unknown } | undefined)?.missingChunks;
+        const indexes = Array.isArray(missing) && missing.length > 0
+            ? missing.filter(index => Number.isInteger(index) && index >= 0 && index < entry.chunks!.length) as number[]
+            : entry.chunks.map(chunk => chunk.index);
+
+        for (const index of indexes) {
+            const chunk = entry.chunks[index];
+            if (chunk.state === 'done') {
+                chunk.state = 'pending';
+                this.addUploadedBytes(entry, -(chunk.end - chunk.start));
+            }
         }
     }
 
@@ -1304,6 +1383,9 @@ export class TurboPush {
      */
     private async finalizeWithRetries(session: Session, entry: FileEntry): Promise<UploadResult> {
         for (let attempt = 1; ; attempt++) {
+            if (session.cancelled) {
+                throw new TurboPushError('Upload cancelled', { code: 'cancelled' });
+            }
             try {
                 return await this.finalizeUpload(entry);
             } catch (error) {
@@ -1362,7 +1444,11 @@ export class TurboPush {
             });
             data = (body.data && typeof body.data === 'object' ? body.data : {}) as Record<string, unknown>;
         } catch (error) {
-            // Unknown upload (or a server without the status action): start fresh
+            // Unknown upload: start fresh. For any other failure the server may
+            // hold chunks of a different size under this ID, so drop them first
+            if (!(error instanceof TurboPushError && error.status === 404) && !session.cancelled) {
+                await this.sendAbort(fileId);
+            }
             return;
         }
 
@@ -1398,8 +1484,11 @@ export class TurboPush {
             && data.totalChunks === entry.chunks.length
             && Array.isArray(uploaded)) {
             for (const index of uploaded) {
-                const chunk = entry.chunks[index as number];
-                if (chunk && chunk.state !== 'done') {
+                if (!Number.isInteger(index) || index < 0 || index >= entry.chunks.length) {
+                    continue;
+                }
+                const chunk = entry.chunks[index];
+                if (chunk.state !== 'done') {
                     chunk.state = 'done';
                     this.addUploadedBytes(entry, chunk.end - chunk.start);
                 }
@@ -1624,7 +1713,7 @@ export class TurboPush {
      */
     private addUploadedBytes(entry: FileEntry, bytes: number): void {
         const progress = entry.progress;
-        progress.uploadedSize = Math.min(progress.uploadedSize + bytes, entry.file.size);
+        progress.uploadedSize = Math.max(0, Math.min(progress.uploadedSize + bytes, entry.file.size));
         progress.percentage = entry.file.size > 0 ? (progress.uploadedSize / entry.file.size) * 100 : 0;
         this.stats.uploadedBytes += bytes;
     }
@@ -1719,7 +1808,8 @@ export class TurboPush {
                 end,
                 blob: file.slice(start, end),
                 attempts: 0,
-                state: 'pending'
+                state: 'pending',
+                token: 0
             });
         }
         return chunks;
@@ -1757,15 +1847,18 @@ export class TurboPush {
      */
     private sleep(session: Session, ms: number): Promise<void> {
         return new Promise(resolve => {
-            const timer = setTimeout(() => {
-                session.timers.delete(timer);
-                resolve();
-            }, ms);
-            session.timers.add(timer);
             if (session.cancelled) {
-                clearTimeout(timer);
                 resolve();
+                return;
             }
+            const sleeper = {
+                timer: setTimeout(() => {
+                    session.sleepers.delete(sleeper);
+                    resolve();
+                }, ms),
+                wake: () => resolve()
+            };
+            session.sleepers.add(sleeper);
         });
     }
 

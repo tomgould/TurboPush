@@ -144,4 +144,34 @@ describe('TurboPush Resumable Uploads', () => {
 
         expect(stats.completedFiles).toBe(1);
     });
+
+    test('ignores invalid chunk indexes in the status response', async () => {
+        const file = makeFile(2000);
+        localStorage.setItem(`turbopush:${mockServer.getEndpoint()}:video.mp4:2000:1700000000000`, 'stored-id');
+        mockServer.intercept(req => req.kind === 'status'
+            ? MockServer.json(200, { success: true, data: {
+                complete: false, fileSize: 2000, totalChunks: 2, uploadedChunks: ['__proto__', -1, 7, 1.5, 'x']
+            } })
+            : undefined);
+
+        const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), chunkSize: 1000, resumable: true });
+        const stats = await turbopush.addFile(file).push();
+
+        expect((Array.prototype as any).state).toBeUndefined();
+        expect(stats).toMatchObject({ completedFiles: 1, uploadedBytes: 2000 });
+        expect(mockServer.getParsedRequests('chunk')).toHaveLength(2);
+    });
+
+    test('drops server data when the status check fails for another reason', async () => {
+        const file = makeFile(2000);
+        localStorage.setItem(`turbopush:${mockServer.getEndpoint()}:video.mp4:2000:1700000000000`, 'stored-id');
+        mockServer.intercept(req => req.kind === 'status' ? MockServer.json(500, { success: false }) : undefined);
+
+        const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), chunkSize: 1000, resumable: true });
+        const stats = await turbopush.addFile(file).push();
+
+        expect(mockServer.getParsedRequests('abort').map(r => r.fileId)).toEqual(['stored-id']);
+        expect(stats.completedFiles).toBe(1);
+    });
 });
+

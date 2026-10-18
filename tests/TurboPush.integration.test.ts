@@ -335,4 +335,119 @@ describe('TurboPush Integration Tests', () => {
             expect(turbopush.getFileProgress('good.txt')!.status).toBe('completed');
         });
     });
+
+    describe('Edge Cases', () => {
+        test('push() right after a failure settles even while aborted chunks are still finishing', async () => {
+            mockServer.setLatency(40);
+            let reject = true;
+            mockServer.intercept(req =>
+                reject && req.kind === 'chunk' && req.chunkIndex === 0
+                    ? MockServer.json(415, { success: false, message: 'Nope' })
+                    : undefined
+            );
+            const { file, content } = patternFile(4000);
+            const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), chunkSize: 1000, maxConcurrentUploads: 4 });
+            turbopush.addFile(file);
+
+            const first = await turbopush.push();
+            expect(first.failedFiles).toBe(1);
+
+            reject = false;
+            const second = await turbopush.push();
+
+            expect(second).toMatchObject({ completedFiles: 1, failedFiles: 0, uploadedBytes: 4000 });
+            expect(await mockServer.readAssembled(turbopush.getProgress()[0].fileId)).toBe(content);
+        });
+
+        test('push() from onComplete does not change the first result', async () => {
+            mockServer.intercept(req =>
+                req.kind === 'chunk' && String(req.fields!.fileName) === 'bad.txt'
+                    ? MockServer.json(415, { success: false, message: 'Nope' })
+                    : undefined
+            );
+            const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint() });
+            let nested: Promise<unknown> | null = null;
+            turbopush.addFile(patternFile(100, 'bad.txt').file).onComplete(() => {
+                if (!nested) {
+                    turbopush.addFile(patternFile(100, 'later.txt').file);
+                    nested = turbopush.push();
+                }
+            });
+
+            const first = await turbopush.push();
+            await nested;
+
+            expect(first).toMatchObject({ totalFiles: 1, failedFiles: 1 });
+            expect(first.duration).toBeDefined();
+            expect(turbopush.getFileProgress('later.txt')!.status).toBe('completed');
+        });
+
+        test('cancel() from onProgress stops before any chunk is sent', async () => {
+            const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), chunkSize: 100 });
+            turbopush.addFile(patternFile(1000).file).onProgress(() => turbopush.cancel());
+
+            const stats = await turbopush.push();
+
+            expect(stats.cancelled).toBe(true);
+            await delay(50);
+            expect(mockServer.getParsedRequests('chunk')).toHaveLength(0);
+            expect(mockServer.getParsedRequests('finalize')).toHaveLength(0);
+        });
+
+        test('pause() from onProgress stops before any chunk is sent', async () => {
+            const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), chunkSize: 100 });
+            let paused = false;
+            turbopush.addFile(patternFile(1000).file).onProgress(() => {
+                if (!paused) {
+                    paused = true;
+                    turbopush.pause();
+                }
+            });
+
+            const pushed = turbopush.push();
+            await delay(50);
+            expect(mockServer.getParsedRequests('chunk')).toHaveLength(0);
+
+            await turbopush.resume();
+            expect((await pushed).completedFiles).toBe(1);
+        });
+
+        test('chunks the server lost are sent again on the next push()', async () => {
+            const { file, content } = patternFile(3000);
+            let lose = true;
+            mockServer.intercept(req => {
+                if (lose && req.kind === 'finalize') {
+                    lose = false;
+                    mockServer.getUpload(req.fileId!)!.chunks.delete(1);
+                }
+                return undefined;
+            });
+            const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), chunkSize: 1000 });
+            turbopush.addFile(file);
+
+            const first = await turbopush.push();
+            expect(first.failedFiles).toBe(1);
+            expect(turbopush.getProgress()[0].uploadedSize).toBe(2000);
+
+            const before = mockServer.getParsedRequests('chunk').length;
+            const second = await turbopush.push();
+
+            expect(second.completedFiles).toBe(1);
+            expect(mockServer.getParsedRequests('chunk').slice(before).map(r => r.chunkIndex)).toEqual([1]);
+            expect(await mockServer.readAssembled(turbopush.getProgress()[0].fileId)).toBe(content);
+        });
+
+        test('cancel() during a finalize retry sends nothing more', async () => {
+            mockServer.intercept(req => req.kind === 'finalize' ? MockServer.json(503, { success: false }) : undefined);
+            const turbopush = new TurboPush({ endpoint: mockServer.getEndpoint(), retryDelay: 100 });
+            turbopush.addFile(patternFile(100).file).onRetry(() => turbopush.cancel());
+
+            const stats = await turbopush.push();
+            await delay(300);
+
+            expect(stats.cancelled).toBe(true);
+            expect(mockServer.getParsedRequests('finalize')).toHaveLength(1);
+        });
+    });
 });
+
