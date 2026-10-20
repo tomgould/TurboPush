@@ -25,11 +25,11 @@ The PHP endpoint is the part that faces the internet, so it is strict: it valida
 ## Install
 
 ```bash
-npm install turbopush              # browser client
-composer require tomgould/turbopush  # PHP endpoint
+npm install github:tomgould/TurboPush  # browser client (builds on install)
+composer require tomgould/turbopush    # PHP endpoint
 ```
 
-Both can also be installed straight from GitHub: `npm install github:tomgould/TurboPush` (builds on install), or for Composer add the repository as a [VCS repository](https://getcomposer.org/doc/05-repositories.md#vcs). Without Composer, copy `TurboPushEndpoint.php` and the `php/` folder and `require_once 'TurboPushEndpoint.php'`.
+TurboPush is not on npm yet, so install the client from GitHub as above. Composer installs the PHP endpoint from Packagist; to use the GitHub repository instead, add it as a [VCS repository](https://getcomposer.org/doc/05-repositories.md#vcs). Without Composer, copy `TurboPushEndpoint.php` and the `php/` folder and `require_once 'TurboPushEndpoint.php'`.
 
 ## Quick start
 
