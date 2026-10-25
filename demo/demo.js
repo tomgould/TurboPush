@@ -67,6 +67,25 @@ function logEvent(message) {
     eventLog.scrollTop = eventLog.scrollHeight;
 }
 
+// The status chip: a word and a symbol for each state, so it never relies on colour
+const STATUS_CHIPS = {
+    pending: ['○', 'Pending'],
+    uploading: ['↑', 'Uploading'],
+    paused: ['‖', 'Paused'],
+    completed: ['✓', 'Done'],
+    failed: ['✕', 'Failed']
+};
+
+function setStatus(element, status) {
+    if (element.dataset.state === status) return;
+    element.dataset.state = status;
+    const [icon, label] = STATUS_CHIPS[status] || STATUS_CHIPS.pending;
+    const chip = element.querySelector('.status');
+    chip.innerHTML = '<span class="status-icon" aria-hidden="true"></span>';
+    chip.firstChild.textContent = icon;
+    chip.append(label);
+}
+
 // Create progress element for a file (textContent only: file names are user input)
 function createProgressElement(progress) {
     const div = document.createElement('div');
@@ -74,20 +93,23 @@ function createProgressElement(progress) {
     div.id = `file-${progress.fileId}`;
 
     div.innerHTML = `
-        <div class="file-name"></div>
-        <div class="progress-bar-container">
-            <div class="progress-bar" style="width: 0%">0%</div>
+        <div class="file-head">
+            <span class="file-name"></span>
+            <span class="file-size"></span>
+            <span class="status"></span>
+        </div>
+        <div class="progress-bar-container" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div class="progress-bar" style="width: 0%"></div>
         </div>
         <div class="file-details">
-            <span>
-                <span class="status status-pending">Pending</span>
-                <span class="file-size"></span>
-            </span>
+            <span class="file-percent">0%</span>
             <span class="file-speed">0 B/s | ETA: --</span>
         </div>
     `;
     div.querySelector('.file-name').textContent = progress.fileName;
     div.querySelector('.file-size').textContent = formatBytes(progress.totalSize);
+    div.querySelector('.progress-bar-container').setAttribute('aria-label', `${progress.fileName} upload progress`);
+    setStatus(div, 'pending');
 
     return div;
 }
@@ -98,18 +120,16 @@ function updateProgressElement(progress) {
     if (!element) return;
 
     const progressBar = element.querySelector('.progress-bar');
-    const status = element.querySelector('.status');
     const speed = element.querySelector('.file-speed');
 
     // Update progress bar
     const percentage = Math.round(progress.percentage);
     progressBar.style.width = `${percentage}%`;
-    progressBar.textContent = `${percentage}%`;
+    progressBar.parentElement.setAttribute('aria-valuenow', String(percentage));
+    element.querySelector('.file-percent').textContent = `${percentage}%`;
 
-    // Update status class
-    progressBar.className = `progress-bar ${progress.status}`;
-    status.className = `status status-${progress.status}`;
-    status.textContent = progress.status;
+    // Update the state (the chip and the bar's colour follow it)
+    setStatus(element, progress.status);
 
     // Update speed and ETA
     if (progress.status === 'uploading') {

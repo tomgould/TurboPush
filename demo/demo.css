@@ -1,0 +1,432 @@
+/*
+ * TurboPush demo, on top of the design kit (kit/css). Colours come only from
+ * the kit's tokens, so both themes follow without any branching here.
+ */
+
+.page {
+    padding-bottom: var(--space-5);
+}
+
+/* Head: a strip of chunks that fills once on load, then the title */
+
+.intro {
+    padding-top: var(--space-5);
+}
+
+.mark {
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 4px;
+    max-width: 15rem;
+}
+
+.mark i {
+    display: block;
+    height: 10px;
+    border-radius: 2px;
+    background: var(--sun);
+    animation: fill-in 420ms var(--ease-out) both;
+}
+
+.mark i:nth-child(1) { animation-delay: 0ms; }
+.mark i:nth-child(2) { animation-delay: 70ms; }
+.mark i:nth-child(3) { animation-delay: 140ms; }
+.mark i:nth-child(4) { animation-delay: 35ms; }
+.mark i:nth-child(5) { animation-delay: 210ms; }
+.mark i:nth-child(6) { animation-delay: 105ms; }
+.mark i:nth-child(7) { animation-delay: 280ms; }
+.mark i:nth-child(8) { animation-delay: 175ms; }
+.mark i:nth-child(9) { animation-delay: 350ms; }
+.mark i:nth-child(10) { animation-delay: 245ms; }
+.mark i:nth-child(11) { animation-delay: 420ms; }
+.mark i:nth-child(12) { animation-delay: 315ms; background: var(--ok); }
+
+@keyframes fill-in {
+    from { background: var(--rule); transform: scaleY(0.4); }
+    to { transform: scaleY(1); }
+}
+
+.intro .kit-title {
+    margin-top: var(--space-3);
+}
+
+/* Notes in a margin track beside the demo */
+
+.layout {
+    display: grid;
+    gap: var(--space-4);
+    margin-top: var(--space-5);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--ink);
+}
+
+@media (min-width: 62em) {
+    .layout {
+        grid-template-columns: var(--margin-track) minmax(0, 1fr);
+        gap: var(--track-gap);
+    }
+}
+
+.notes h2 {
+    font-family: var(--font-display);
+    font-size: 1rem;
+    font-weight: 700;
+}
+
+.notes p {
+    margin-top: var(--space-1);
+    color: var(--ink-soft);
+}
+
+.notes code {
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    font-size: 0.85em;
+}
+
+.facts {
+    margin: var(--space-3) 0 0;
+    padding: var(--space-2) 0 0;
+    border-top: 1px solid var(--rule);
+    list-style: none;
+    font-size: var(--ui-small);
+    color: var(--muted);
+}
+
+.facts li + li {
+    margin-top: var(--space-1);
+}
+
+/* The demo itself */
+
+.try {
+    min-width: 0;
+    padding: var(--space-4);
+    border: 1px solid var(--rule);
+    border-radius: 12px;
+    background: var(--page-raised);
+}
+
+@media (max-width: 30em) {
+    .try {
+        padding: var(--space-3);
+    }
+}
+
+.try h2 {
+    font-family: var(--font-display);
+    font-size: var(--step-1);
+    font-weight: 800;
+    letter-spacing: -0.02em;
+}
+
+/* File picker. The file input is the control: hidden from sight, never from
+   the keyboard, so Tab reaches it and Enter or Space opens the file picker.
+   The pill only shows where it is; the whole zone is its label. */
+
+.drop {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    margin-top: var(--space-3);
+    padding: var(--space-4) var(--space-3);
+    border: 2px dashed var(--control-edge);
+    border-radius: 12px;
+    background: var(--page);
+    cursor: pointer;
+    transition: border-color 120ms, background-color 120ms;
+}
+
+.drop:hover {
+    border-color: var(--link);
+    background: var(--sun-halo);
+}
+
+.drop:has(input:focus-visible) {
+    border-color: var(--link);
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 3px;
+}
+
+.drop:has(input:disabled) {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.drop:has(input:disabled):hover {
+    border-color: var(--control-edge);
+    background: var(--page);
+}
+
+.drop input[type="file"] {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+.drop-button {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 1.25rem;
+    border-radius: 999px;
+    background: var(--button-fill);
+    color: var(--button-ink);
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.drop:hover .drop-button {
+    filter: brightness(1.08);
+}
+
+.drop-main {
+    font-size: 1.0625rem;
+    font-weight: 600;
+}
+
+.drop-sub {
+    flex-basis: 100%;
+    font-size: var(--ui-small);
+    color: var(--muted);
+}
+
+/* Options */
+
+.options {
+    display: grid;
+    gap: var(--space-1);
+    margin: var(--space-3) 0;
+    padding: 0;
+    border: 0;
+}
+
+.options legend {
+    margin-bottom: var(--space-1);
+    padding: 0;
+    font-weight: 600;
+}
+
+.options label {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-start;
+    min-height: 24px;
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+
+.options input {
+    flex: none;
+    width: 1.125rem;
+    height: 1.125rem;
+    margin: 0.1rem 0 0;
+    accent-color: var(--button-fill);
+    cursor: pointer;
+}
+
+.controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.controls .kit-button {
+    min-height: 44px;
+}
+
+/* Totals */
+
+.stats dl {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+    gap: var(--space-2) var(--space-3);
+    margin: var(--space-3) 0 0;
+    padding: var(--space-2) 0;
+    border-block: 1px solid var(--rule);
+}
+
+.stats dt {
+    font-size: var(--ui-small);
+    color: var(--muted);
+}
+
+.stats dd {
+    margin: 0;
+    font-size: 1.0625rem;
+    font-weight: 650;
+}
+
+/* Files */
+
+.progress-list {
+    display: grid;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+}
+
+.progress-list:empty {
+    display: none;
+}
+
+.file-progress {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    background: var(--page);
+}
+
+.file-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-2);
+    align-items: center;
+}
+
+.file-name {
+    flex: 1 1 12rem;
+    min-width: 0;
+    font-weight: 650;
+    overflow-wrap: anywhere;
+}
+
+.file-size {
+    flex: none;
+    font-size: var(--ui-small);
+    color: var(--muted);
+}
+
+/* Status chips. Each state has its own word, symbol and shape, so none
+   depends on colour alone. */
+
+.status {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    gap: 0.35em;
+    min-height: 24px;
+    padding: 0 0.65rem;
+    border: 1.5px solid var(--rule-strong);
+    border-radius: 999px;
+    font-size: var(--ui-small);
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--ink-soft);
+    white-space: nowrap;
+}
+
+.status-icon {
+    font-size: 0.95em;
+    line-height: 1;
+}
+
+.file-progress[data-state="uploading"] .status {
+    border-color: var(--ink);
+    background: var(--ink);
+    color: var(--page);
+}
+
+.file-progress[data-state="paused"] .status {
+    border-style: dashed;
+    border-color: var(--ink);
+    color: var(--ink);
+}
+
+.file-progress[data-state="completed"] .status {
+    border-color: var(--ok);
+    color: var(--ok);
+}
+
+.file-progress[data-state="failed"] .status {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+/* Progress bar: the accent while sending, then the state's colour */
+
+.progress-bar-container {
+    height: 12px;
+    margin: var(--space-2) 0 var(--space-1);
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--rule);
+}
+
+.progress-bar {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--sun);
+    transition: width 0.3s ease;
+}
+
+.file-progress[data-state="completed"] .progress-bar { background: var(--ok); }
+.file-progress[data-state="failed"] .progress-bar { background: var(--danger); }
+.file-progress[data-state="paused"] .progress-bar { background: var(--muted); }
+
+.file-details {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0 var(--space-2);
+    font-size: var(--ui-small);
+    color: var(--muted);
+}
+
+.file-percent {
+    font-weight: 600;
+    color: var(--ink-soft);
+}
+
+.stored-name {
+    margin-top: var(--space-1);
+    font-size: var(--ui-small);
+    color: var(--muted);
+    overflow-wrap: anywhere;
+}
+
+.error-message {
+    margin-top: var(--space-1);
+    font-size: var(--ui-small);
+    font-weight: 600;
+    color: var(--danger);
+}
+
+/* Event log */
+
+.log {
+    margin-top: var(--space-3);
+    font-size: var(--ui-small);
+}
+
+.log summary {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+
+#eventLog {
+    max-height: 14rem;
+    margin-top: var(--space-1);
+    padding: var(--space-2);
+    overflow-y: auto;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    background: var(--page);
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+#eventLog:empty::before {
+    content: "Nothing yet.";
+    color: var(--muted);
+    font-family: var(--font-ui);
+}

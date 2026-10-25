@@ -20,8 +20,11 @@ The page imports the built client from `dist/esm/TurboPush.js`, so run
 ## Files
 
 - `index.html` - the upload form
+- `demo.css` - the page's styles, on top of the design kit
 - `demo.js` - demo logic, using the public API only
 - `upload.php` - the demo endpoint
+- `kit/` - the shared design kit: styles, theme switch scripts, fonts (with
+  their licences) and icons, all local, so the page loads nothing from outside
 
 ## Where uploads go
 

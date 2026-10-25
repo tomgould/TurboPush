@@ -2,330 +2,118 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>TurboPush Demo</title>
-    <link rel="icon" href="data:,">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            padding: 40px 20px;
-            max-width: 800px;
-            margin: 0 auto;
-            background: #f5f5f5;
-        }
-        
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        
-        h1 {
-            margin-bottom: 30px;
-            color: #333;
-        }
-        
-        .upload-section {
-            margin-bottom: 30px;
-        }
-        
-        .file-input-wrapper {
-            margin-bottom: 20px;
-        }
-        
-        input[type="file"] {
-            display: block;
-            padding: 10px;
-            border: 2px dashed #ddd;
-            border-radius: 4px;
-            width: 100%;
-            cursor: pointer;
-        }
-        
-        input[type="file"]:hover {
-            border-color: #0066cc;
-        }
-        
-        .controls {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-        
-        button {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            transition: background-color 0.2s;
-        }
-        
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .btn-upload {
-            background: #0066cc;
-            color: white;
-        }
-        
-        .btn-upload:hover:not(:disabled) {
-            background: #0052a3;
-        }
-        
-        .btn-pause {
-            background: #ff9500;
-            color: white;
-        }
-        
-        .btn-pause:hover:not(:disabled) {
-            background: #cc7700;
-        }
-        
-        .btn-cancel {
-            background: #ff3b30;
-            color: white;
-        }
-        
-        .btn-cancel:hover:not(:disabled) {
-            background: #cc2f26;
-        }
-        
-        .stats {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 4px;
-            margin-bottom: 20px;
-            font-size: 14px;
-        }
-        
-        .stats-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 8px;
-        }
-        
-        .stats-row:last-child {
-            margin-bottom: 0;
-        }
-        
-        .stats-label {
-            font-weight: 600;
-            color: #666;
-        }
-        
-        .stats-value {
-            color: #333;
-        }
-        
-        .progress-list {
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        
-        .file-progress {
-            background: #fff;
-            border: 1px solid #e0e0e0;
-            border-radius: 4px;
-            padding: 15px;
-            margin-bottom: 10px;
-        }
-        
-        .file-name {
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 8px;
-            word-break: break-all;
-        }
-        
-        .progress-bar-container {
-            background: #e0e0e0;
-            border-radius: 4px;
-            height: 20px;
-            overflow: hidden;
-            margin-bottom: 8px;
-        }
-        
-        .progress-bar {
-            height: 100%;
-            background: #0066cc;
-            transition: width 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        
-        .progress-bar.completed {
-            background: #34c759;
-        }
-        
-        .progress-bar.failed {
-            background: #ff3b30;
-        }
-        
-        .progress-bar.paused {
-            background: #ff9500;
-        }
-        
-        .file-details {
-            display: flex;
-            justify-content: space-between;
-            font-size: 12px;
-            color: #666;
-        }
-        
-        .status {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 3px;
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-        }
-        
-        .status-pending {
-            background: #f0f0f0;
-            color: #666;
-        }
-        
-        .status-uploading {
-            background: #e3f2fd;
-            color: #0066cc;
-        }
-        
-        .status-completed {
-            background: #d1f4e0;
-            color: #28a745;
-        }
-        
-        .status-failed {
-            background: #ffebee;
-            color: #ff3b30;
-        }
-        
-        .status-paused {
-            background: #fff3e0;
-            color: #ff9500;
-        }
-        
-        .error-message {
-            color: #ff3b30;
-            font-size: 12px;
-            margin-top: 5px;
-        }
-
-        .options {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 16px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            color: #333;
-        }
-
-        .options label {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            cursor: pointer;
-        }
-
-        .stored-name {
-            font-size: 12px;
-            color: #666;
-            margin-top: 5px;
-        }
-
-        .event-log {
-            margin-top: 20px;
-            background: #f8f9fa;
-            border-radius: 4px;
-            padding: 10px 15px;
-            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            font-size: 12px;
-            color: #444;
-            max-height: 200px;
-            overflow-y: auto;
-        }
-
-        .event-log:empty {
-            display: none;
-        }
-
-        .event-log div {
-            padding: 2px 0;
-        }
-    </style>
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#fbf7f0" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#11100e" media="(prefers-color-scheme: dark)">
+    <link rel="icon" href="kit/images/favicon.svg" type="image/svg+xml">
+    <link rel="preload" href="kit/fonts/schibsted-grotesk-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="kit/css/tokens.css">
+    <link rel="stylesheet" href="kit/css/base.css">
+    <link rel="stylesheet" href="kit/css/kit.css">
+    <link rel="stylesheet" href="demo.css">
+    <!-- Sets the chosen theme before first paint, so it is not deferred -->
+    <script src="kit/js/theme-init.js"></script>
+    <script src="kit/js/theme-switch.js" defer></script>
 </head>
 <body>
-    <div class="container">
-        <h1>TurboPush Demo</h1>
-        
-        <div class="upload-section">
-            <div class="file-input-wrapper">
+<a class="visually-hidden focusable skip-link" href="#main">Skip to the demo</a>
+<header class="kit-masthead">
+    <div class="kit-column">
+        <div class="kit-masthead__bar">
+            <span>
+                <a class="kit-wordmark" href="https://www.dealmobile.co.uk/">Tom Gould<span class="kit-wordmark__dot">.</span></a><span class="kit-app">TurboPush</span>
+            </span>
+            <nav class="kit-nav" aria-label="TurboPush">
+                <ul class="kit-nav__list">
+                    <li><a class="kit-nav__link" href="https://www.dealmobile.co.uk/projects/turbopush">Project page</a></li>
+                    <li><a class="kit-nav__link" href="https://github.com/tomgould/TurboPush" target="_blank" rel="noopener noreferrer">Source<span class="visually-hidden"> (opens in a new tab)</span></a></li>
+                </ul>
+            </nav>
+            <fieldset class="kit-theme-switch" data-theme-switch hidden>
+                <legend class="visually-hidden">Theme</legend>
+                <span class="kit-theme-switch__options">
+                    <label><input type="radio" name="theme-top" value="system">System</label>
+                    <label><input type="radio" name="theme-top" value="light">Light</label>
+                    <label><input type="radio" name="theme-top" value="dark">Dark</label>
+                </span>
+            </fieldset>
+        </div>
+    </div>
+</header>
+
+<main id="main" class="kit-column page">
+    <header class="intro">
+        <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <h1 class="kit-title">TurboPush <em>demo</em>.</h1>
+        <p class="kit-standfirst">Pick some files and watch them go up in 1&nbsp;MB chunks, four at a time, with retries, pause, resume and cancel.</p>
+    </header>
+
+    <div class="layout">
+        <section class="notes ui" aria-labelledby="notes-title">
+            <h2 id="notes-title">Running on your machine</h2>
+            <p>Uploads go to <code>upload.php</code> in this folder, which stores them under your system temp directory, never in the project.</p>
+            <ul class="facts">
+                <li>Chunks of 1&nbsp;MB, within PHP's default upload limit</li>
+                <li>Four chunk requests at a time</li>
+                <li>Three retries per chunk, after 1, 2 and 4 seconds</li>
+            </ul>
+        </section>
+
+        <section class="try ui" aria-labelledby="try-title">
+            <h2 id="try-title">Try it</h2>
+
+            <label class="drop" for="fileInput">
+                <span class="drop-button">Choose files</span>
+                <span class="drop-main">to upload</span>
+                <span class="drop-sub">Pick one or more files, then press Upload Files</span>
                 <input type="file" id="fileInput" multiple>
-            </div>
-            
-            <div class="options">
-                <label>
-                    <input type="checkbox" id="simulateFailures">
-                    Simulate failures (the first attempt of chunks 1, 5, 9, ... fails)
-                </label>
-                <label>
-                    <input type="checkbox" id="resumable">
-                    Resume after reload
-                </label>
-            </div>
+            </label>
+
+            <fieldset class="options">
+                <legend>Options</legend>
+                <label><input type="checkbox" id="simulateFailures"> Simulate failures (the first attempt of chunks 1, 5, 9, ... fails)</label>
+                <label><input type="checkbox" id="resumable"> Resume after reload</label>
+            </fieldset>
 
             <div class="controls">
-                <button id="uploadBtn" class="btn-upload" disabled>Upload Files</button>
-                <button id="pauseBtn" class="btn-pause" disabled>Pause</button>
-                <button id="cancelBtn" class="btn-cancel" disabled>Cancel</button>
+                <button type="button" id="uploadBtn" class="kit-button" disabled>Upload Files</button>
+                <button type="button" id="pauseBtn" class="kit-button kit-button--quiet" disabled>Pause</button>
+                <button type="button" id="cancelBtn" class="kit-button kit-button--quiet" disabled>Cancel</button>
             </div>
-            
-            <div id="stats" class="stats" style="display: none;">
-                <div class="stats-row">
-                    <span class="stats-label">Total Files:</span>
-                    <span class="stats-value" id="totalFiles">0</span>
-                </div>
-                <div class="stats-row">
-                    <span class="stats-label">Completed:</span>
-                    <span class="stats-value" id="completedFiles">0</span>
-                </div>
-                <div class="stats-row">
-                    <span class="stats-label">Failed:</span>
-                    <span class="stats-value" id="failedFiles">0</span>
-                </div>
-                <div class="stats-row">
-                    <span class="stats-label">Overall Progress:</span>
-                    <span class="stats-value" id="overallProgress">0%</span>
-                </div>
-                <div class="stats-row">
-                    <span class="stats-label">Average Speed:</span>
-                    <span class="stats-value" id="avgSpeed">0 B/s</span>
-                </div>
-            </div>
-        </div>
-        
-        <div id="progressList" class="progress-list"></div>
 
-        <div id="eventLog" class="event-log" aria-live="polite"></div>
+            <div id="stats" class="stats" style="display: none;">
+                <dl>
+                    <div><dt>Total files</dt><dd id="totalFiles">0</dd></div>
+                    <div><dt>Completed</dt><dd id="completedFiles">0</dd></div>
+                    <div><dt>Failed</dt><dd id="failedFiles">0</dd></div>
+                    <div><dt>Overall progress</dt><dd id="overallProgress">0%</dd></div>
+                    <div><dt>Speed</dt><dd id="avgSpeed">0 B/s</dd></div>
+                </dl>
+            </div>
+
+            <div id="progressList" class="progress-list"></div>
+
+            <details class="log" open>
+                <summary>Event log</summary>
+                <div id="eventLog" role="log" aria-live="polite" aria-label="Event log" tabindex="0"></div>
+            </details>
+        </section>
     </div>
-    
-    <script type="module" src="./demo.js"></script>
+</main>
+
+<footer class="kit-footer">
+    <div class="kit-column kit-footer__rows">
+        <ul class="kit-footer__links">
+            <li><a href="https://www.dealmobile.co.uk/">Tom Gould</a></li>
+            <li><a href="https://www.dealmobile.co.uk/projects/turbopush">About TurboPush</a></li>
+            <li><a href="https://github.com/tomgould/TurboPush" target="_blank" rel="noopener noreferrer">Source on GitHub<span class="visually-hidden"> (opens in a new tab)</span></a></li>
+        </ul>
+        <p>TurboPush is MIT licensed. Set in Schibsted Grotesk and Libre Caslon.</p>
+    </div>
+</footer>
+
+<script type="module" src="./demo.js"></script>
 </body>
 </html>
-
