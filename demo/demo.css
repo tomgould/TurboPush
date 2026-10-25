@@ -430,3 +430,157 @@
     color: var(--muted);
     font-family: var(--font-ui);
 }
+
+/* Without JavaScript nothing can be sent, so the page says so */
+
+.noscript {
+    margin-top: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1.5px solid var(--danger);
+    border-radius: 10px;
+    font-weight: 600;
+}
+
+/* Links in lists are targets of at least 24px */
+
+.kit-footer__links a {
+    display: inline-block;
+    padding-block: 0.15rem;
+}
+
+/* More contrast when asked for: secondary text takes the body colour and
+   edges the strong rule */
+
+@media (prefers-contrast: more) {
+    :root,
+    :root[data-theme],
+    :root:not([data-theme="light"]) {
+        --muted: var(--ink-soft);
+        --rule: var(--rule-strong);
+        --control-edge: var(--ink);
+    }
+}
+
+/* Forced colours (Windows High Contrast): fills are dropped, so buttons get
+   an edge, the chosen theme an outline, and the bars system colours */
+
+@media (forced-colors: active) {
+    .kit-button,
+    .drop-button {
+        border: 2px solid ButtonText;
+    }
+
+    .kit-theme-switch label:has(input:checked) {
+        outline: 2px solid Highlight;
+        outline-offset: -2px;
+    }
+
+    .mark i:nth-child(n),
+    .progress-bar-container {
+        forced-color-adjust: none;
+        background: Canvas;
+        border: 1px solid CanvasText;
+    }
+
+    .file-progress[data-state] .progress-bar {
+        forced-color-adjust: none;
+        background: Highlight;
+    }
+}
+
+/* Print: ink on white in one column, without the controls. What prints is
+   the title, the notes, the totals, the files and an open event log. */
+
+@media print {
+    :root,
+    :root[data-theme],
+    :root:not([data-theme="light"]) {
+        color-scheme: light;
+        --page: #fff;
+        --page-raised: #fff;
+        --ink: #000;
+        --ink-soft: #222;
+        --muted: #444;
+        --rule: #bbb;
+        --rule-strong: #777;
+        --control-edge: #777;
+        --link: #000;
+        --link-hover: #000;
+        --sun: #b8300f;
+        --ok: #1f6b3a;
+        --danger: #a3261b;
+    }
+
+    @page {
+        margin: 16mm;
+    }
+
+    body {
+        font-size: 11pt;
+    }
+
+    .kit-masthead,
+    .skip-link,
+    .kit-theme-switch,
+    .drop,
+    .options,
+    .controls,
+    .noscript,
+    .log:not([open]),
+    .log summary,
+    .kit-footer__links {
+        display: none !important;
+    }
+
+    .kit-column {
+        width: auto;
+    }
+
+    .intro {
+        padding-top: 0;
+    }
+
+    .intro .kit-title {
+        font-size: 28pt;
+    }
+
+    .kit-standfirst {
+        font-size: 13pt;
+    }
+
+    .layout {
+        display: block;
+        margin-top: var(--space-3);
+    }
+
+    .notes {
+        margin-bottom: var(--space-3);
+    }
+
+    .try {
+        padding: 0;
+        border: 0;
+    }
+
+    .mark i,
+    .progress-bar-container,
+    .progress-bar,
+    .status {
+        print-color-adjust: exact;
+        -webkit-print-color-adjust: exact;
+    }
+
+    .file-progress {
+        break-inside: avoid;
+    }
+
+    #eventLog {
+        max-height: none;
+        overflow: visible;
+    }
+
+    .kit-footer {
+        margin-top: var(--space-4);
+        padding-block: var(--space-2) 0;
+    }
+}

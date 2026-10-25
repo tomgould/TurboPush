@@ -8,6 +8,7 @@
     <meta name="theme-color" content="#fbf7f0" media="(prefers-color-scheme: light)">
     <meta name="theme-color" content="#11100e" media="(prefers-color-scheme: dark)">
     <link rel="icon" href="kit/images/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="kit/images/apple-touch-icon.png">
     <link rel="preload" href="kit/fonts/schibsted-grotesk-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="kit/css/tokens.css">
     <link rel="stylesheet" href="kit/css/base.css">
@@ -63,6 +64,9 @@
 
         <section class="try ui" aria-labelledby="try-title">
             <h2 id="try-title">Try it</h2>
+            <noscript>
+                <p class="noscript">This demo needs JavaScript to send files in chunks, so nothing can be uploaded without it.</p>
+            </noscript>
 
             <label class="drop" for="fileInput">
                 <span class="drop-button">Choose files</span>
