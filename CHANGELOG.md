@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-11-23
+
+Published on a new single-commit history. The 2.1.0 tag pointed at a commit
+that is no longer in the repository, so this release replaces it on
+Packagist. The client and the PHP endpoint are unchanged from 2.1.0.
+
+### Changed
+
+- Demo: restyled on a local design kit (`demo/kit/`: styles, theme switch,
+  fonts with their licences, icons), so the page loads nothing from outside.
+  Styles moved to `demo/demo.css`.
+- README and changelog wording tidied.
+
 ## [2.1.0] - 2026-10-18
 
 The client now speaks tus 1.0.0 as well as TurboPush's own protocol, so it
