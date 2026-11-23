@@ -141,42 +141,27 @@ requirements, defaults and behaviours changed; they are listed under
 
 - Finalize now checks the file name against the upload. The endpoint records
   each upload's name, size and chunk count from the first chunk and refuses
-  later chunks or a finalize request that differ. In 1.x a file uploaded as
-  `photo.jpg` could be finalized as `shell.php`.
-- Upload IDs must match `[A-Za-z0-9_-]{1,200}`, and anything else is
-  rejected. The old sanitisation let `.` and `..` through, which pointed chunk
-  storage and the cleanup after finalize at the parent directory.
+  later chunks or a finalize request that differ.
+- Upload IDs must match `[A-Za-z0-9_-]{1,200}`, and anything else is rejected.
 - Server-executable extensions, and types browsers run scripts in (`html`,
   `svg` and similar), are blocked by default (`setBlockedExtensions()`).
   Leading and trailing dots are stripped, and blocked inner extensions are
-  neutralised (`shell.php.jpg` becomes `shell_php.jpg`). In 1.x, with no
-  allowlist, any extension was accepted, including `.php`, and files such as
-  `.htaccess` and `.user.ini` could be written.
+  neutralised (`shell.php.jpg` becomes `shell_php.jpg`).
 - Chunk indexes, chunk counts and sizes are validated against configurable
   limits (`setMaxChunkSize()`, `setMaxChunks()`), the bytes stored per upload
   may not exceed the declared size, and abandoned chunks are removed
-  (`cleanup()`, `setUploadTtl()`). 1.x checked only the size the client
-  declared and never counted chunks, so a client could fill the disk.
+  (`cleanup()`, `setUploadTtl()`).
 - Each upload is locked while chunks are stored or assembled, chunks and the
   final file are written under temporary names and renamed into place, and
-  final names are reserved with an exclusive create so nothing is
-  overwritten. In 1.x two finalize requests could race each other, and a file
-  with the same name could be truncated.
+  final names are reserved with an exclusive create so nothing is overwritten.
 - The temp directory defaults to a folder under `sys_get_temp_dir()`, created
   with mode 0700, and the endpoint refuses to use it if another user could
-  have created or opened it. The 1.x default, `./uploads/temp/`, was usually
-  inside the web root.
+  have created or opened it.
 - JSON actions require `Content-Type: application/json`, so cross-site
-  finalize, status and abort requests cannot be sent without a CORS
-  preflight.
+  finalize, status and abort requests cannot be sent without a CORS preflight.
 - The endpoint is same-origin only unless you list other origins (see
-  "Breaking changes"). In 1.x the default CORS policy was `*` and
-  cross-origin chunk uploads (ordinary multipart posts) were accepted, so any
-  website could call the endpoint from a visitor's browser.
-- Internal errors are logged and reported as a generic 500. In 1.x error
-  responses could contain server paths (for example "Failed to create dir:
-  /var/www/..."), and PHP errors such as a failed `fopen()` escaped as fatal
-  errors.
+  "Breaking changes").
+- Internal errors are logged and reported as a generic 500.
 - The example endpoint keeps its log outside the public uploads folder.
 
 ### Added
