@@ -1,0 +1,13 @@
+{
+    "name": "turbopush/tus-php-interop",
+    "description": "Minimal tus-php server used by TurboPush's interop tests",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "ankitpokhrel/tus-php": "2.4.0"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

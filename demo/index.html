@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TurboPush Demo</title>
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#fbf7f0" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#11100e" media="(prefers-color-scheme: dark)">
+    <link rel="icon" href="kit/images/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="kit/images/apple-touch-icon.png">
+    <link rel="preload" href="kit/fonts/schibsted-grotesk-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="kit/css/tokens.css">
+    <link rel="stylesheet" href="kit/css/base.css">
+    <link rel="stylesheet" href="kit/css/kit.css">
+    <link rel="stylesheet" href="demo.css">
+    <!-- Sets the chosen theme before first paint, so it is not deferred -->
+    <script src="kit/js/theme-init.js"></script>
+    <script src="kit/js/theme-switch.js" defer></script>
+</head>
+<body>
+<a class="visually-hidden focusable skip-link" href="#main">Skip to the demo</a>
+<header class="kit-masthead">
+    <div class="kit-column">
+        <div class="kit-masthead__bar">
+            <span>
+                <a class="kit-wordmark" href="https://www.dealmobile.co.uk/">Tom Gould<span class="kit-wordmark__dot">.</span></a><span class="kit-app">TurboPush</span>
+            </span>
+            <nav class="kit-nav" aria-label="TurboPush">
+                <ul class="kit-nav__list">
+                    <li><a class="kit-nav__link" href="https://www.dealmobile.co.uk/projects/turbopush">Project page</a></li>
+                    <li><a class="kit-nav__link" href="https://github.com/tomgould/TurboPush" target="_blank" rel="noopener noreferrer">Source<span class="visually-hidden"> (opens in a new tab)</span></a></li>
+                </ul>
+            </nav>
+            <fieldset class="kit-theme-switch" data-theme-switch hidden>
+                <legend class="visually-hidden">Theme</legend>
+                <span class="kit-theme-switch__options">
+                    <label><input type="radio" name="theme-top" value="system">System</label>
+                    <label><input type="radio" name="theme-top" value="light">Light</label>
+                    <label><input type="radio" name="theme-top" value="dark">Dark</label>
+                </span>
+            </fieldset>
+        </div>
+    </div>
+</header>
+
+<main id="main" class="kit-column page">
+    <header class="intro">
+        <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <h1 class="kit-title">TurboPush <em>demo</em>.</h1>
+        <p class="kit-standfirst">Pick some files and watch them go up in 1&nbsp;MB chunks, four at a time, with retries, pause, resume and cancel.</p>
+    </header>
+
+    <div class="layout">
+        <section class="notes ui" aria-labelledby="notes-title">
+            <h2 id="notes-title">Running on your machine</h2>
+            <p>Uploads go to <code>upload.php</code> in this folder, which stores them under your system temp directory, never in the project.</p>
+            <ul class="facts">
+                <li>Chunks of 1&nbsp;MB, within PHP's default upload limit</li>
+                <li>Four chunk requests at a time</li>
+                <li>Three retries per chunk, after 1, 2 and 4 seconds</li>
+            </ul>
+        </section>
+
+        <section class="try ui" aria-labelledby="try-title">
+            <h2 id="try-title">Try it</h2>
+            <noscript>
+                <p class="noscript">This demo needs JavaScript to send files in chunks, so nothing can be uploaded without it.</p>
+            </noscript>
+
+            <label class="drop" for="fileInput">
+                <span class="drop-button">Choose files</span>
+                <span class="drop-main">to upload</span>
+                <span class="drop-sub">Pick one or more files, then press Upload Files</span>
+                <input type="file" id="fileInput" multiple>
+            </label>
+
+            <fieldset class="options">
+                <legend>Options</legend>
+                <label><input type="checkbox" id="simulateFailures"> Simulate failures (the first attempt of chunks 1, 5, 9, ... fails)</label>
+                <label><input type="checkbox" id="resumable"> Resume after reload</label>
+            </fieldset>
+
+            <div class="controls">
+                <button type="button" id="uploadBtn" class="kit-button" disabled>Upload Files</button>
+                <button type="button" id="pauseBtn" class="kit-button kit-button--quiet" disabled>Pause</button>
+                <button type="button" id="cancelBtn" class="kit-button kit-button--quiet" disabled>Cancel</button>
+            </div>
+
+            <div id="stats" class="stats" style="display: none;">
+                <dl>
+                    <div><dt>Total files</dt><dd id="totalFiles">0</dd></div>
+                    <div><dt>Completed</dt><dd id="completedFiles">0</dd></div>
+                    <div><dt>Failed</dt><dd id="failedFiles">0</dd></div>
+                    <div><dt>Overall progress</dt><dd id="overallProgress">0%</dd></div>
+                    <div><dt>Speed</dt><dd id="avgSpeed">0 B/s</dd></div>
+                </dl>
+            </div>
+
+            <div id="progressList" class="progress-list"></div>
+
+            <details class="log" open>
+                <summary>Event log</summary>
+                <div id="eventLog" role="log" aria-live="polite" aria-label="Event log" tabindex="0"></div>
+            </details>
+        </section>
+    </div>
+</main>
+
+<footer class="kit-footer">
+    <div class="kit-column kit-footer__rows">
+        <ul class="kit-footer__links">
+            <li><a href="https://www.dealmobile.co.uk/">Tom Gould</a></li>
+            <li><a href="https://www.dealmobile.co.uk/projects/turbopush">About TurboPush</a></li>
+            <li><a href="https://github.com/tomgould/TurboPush" target="_blank" rel="noopener noreferrer">Source on GitHub<span class="visually-hidden"> (opens in a new tab)</span></a></li>
+        </ul>
+        <p>TurboPush is MIT licensed. Set in Schibsted Grotesk and Libre Caslon.</p>
+    </div>
+</footer>
+
+<script type="module" src="./demo.js"></script>
+</body>
+</html>
